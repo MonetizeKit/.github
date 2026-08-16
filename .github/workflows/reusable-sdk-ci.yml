@@ -25,6 +25,10 @@ on:
         description: Run node scripts/install-smoke.mjs
         type: boolean
         default: true
+      extra-check-command:
+        description: Optional repo-specific command run after the package entry guard (e.g. "pnpm smoke", "pnpm build-storybook")
+        type: string
+        default: ""
 
 jobs:
   commitlint:
@@ -80,6 +84,9 @@ jobs:
       - name: Package entry guard
         if: inputs.package-entry-guard
         run: node scripts/check-package-entry.mjs
+      - name: Extra repo-specific check
+        if: inputs.extra-check-command != ''
+        run: ${{ inputs.extra-check-command }}
 
   install-smoke:
     name: Published-package install smoke
