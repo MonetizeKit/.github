@@ -1,0 +1,13 @@
+{
+  "captured_at": "2026-08-15T20:50:17Z",
+  "repos": {
+    "EtherealVisions/app-monetizekit-monorepo": {"meta": {"default_branch":"main","open_issues":36}, "open_prs": 30, "pr_stats": {"merged_pr_count": 50, "cycle_hrs_median": 0.2, "cycle_hrs_p90": 5.32, "cycle_hrs_mean": 1.57}},
+    "EtherealVisions/app-monetizekit-web": {"meta": {"default_branch":"main","open_issues":2}, "open_prs": 2, "pr_stats": {"merged_pr_count": 50, "cycle_hrs_median": 0.44, "cycle_hrs_p90": 15.8, "cycle_hrs_mean": 4.37}},
+    "MonetizeKit/cli": {"meta": {"default_branch":"main","open_issues":3}, "open_prs": 3, "pr_stats": {"merged_pr_count": 5, "cycle_hrs_median": 2.29, "cycle_hrs_p90": 6.28, "cycle_hrs_mean": 5.4}},
+    "MonetizeKit/node": {"meta": {"default_branch":"main","open_issues":1}, "open_prs": 0, "pr_stats": {"merged_pr_count": 7, "cycle_hrs_median": 13.1, "cycle_hrs_p90": 41.3, "cycle_hrs_mean": 17.93}},
+    "MonetizeKit/react": {"meta": {"default_branch":"main","open_issues":0}, "open_prs": 0, "pr_stats": {"merged_pr_count": 36, "cycle_hrs_median": 0.05, "cycle_hrs_p90": 17.4, "cycle_hrs_mean": 4.02}},
+    "MonetizeKit/embed": {"meta": {"default_branch":"main","open_issues":1}, "open_prs": 1, "pr_stats": {"merged_pr_count": 1, "cycle_hrs_median": 15.1, "cycle_hrs_p90": 15.1, "cycle_hrs_mean": 15.1}},
+    "MonetizeKit/types": {"meta": {"default_branch":"main","open_issues":0}, "open_prs": 0, "pr_stats": {"merged_pr_count": 0}},
+    "MonetizeKit/examples": {"meta": {"default_branch":"main","open_issues":14}, "open_prs": 14, "pr_stats": {"merged_pr_count": 1, "cycle_hrs_median": 0.2, "cycle_hrs_p90": 0.2, "cycle_hrs_mean": 0.2}}
+  }
+}

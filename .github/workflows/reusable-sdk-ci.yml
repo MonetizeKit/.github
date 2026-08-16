@@ -1,0 +1,98 @@
+# Reusable CI for MonetizeKit SDK packages.
+# Callers keep their own "Required Checks Gate" aggregation job so the
+# branch-protection context name stays stable across all repos.
+name: Reusable SDK CI
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        type: string
+        default: "22"
+      run-lint:
+        description: Run pnpm lint (repo must define a lint script)
+        type: boolean
+        default: true
+      run-tests:
+        description: Run pnpm test (repo must define a test script)
+        type: boolean
+        default: true
+      package-entry-guard:
+        description: Run node scripts/check-package-entry.mjs
+        type: boolean
+        default: true
+      install-smoke:
+        description: Run node scripts/install-smoke.mjs
+        type: boolean
+        default: true
+
+jobs:
+  commitlint:
+    # Advisory during burn-in (rollout rule: advisory -> required).
+    # Flip continue-on-error to false once the fleet has a green history.
+    name: Conventional commits (advisory)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+      - name: Lint PR commit messages
+        run: |
+          npm install --no-save @commitlint/cli@19 @commitlint/config-conventional@19
+          echo "export default { extends: ['@commitlint/config-conventional'] };" > commitlint.config.mjs
+          npx commitlint --from "${{ github.event.pull_request.base.sha }}" --to "${{ github.event.pull_request.head.sha }}" --verbose
+
+  build-and-test:
+    name: Lint, Typecheck, Test, Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+      - name: Enable corepack
+        run: corepack enable
+      - name: Get pnpm store directory
+        id: pnpm-store
+        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: pnpm-store-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: pnpm-store-${{ runner.os }}-
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Lint
+        if: inputs.run-lint
+        run: pnpm lint
+      - name: Typecheck
+        run: pnpm typecheck
+      - name: Test
+        if: inputs.run-tests
+        run: pnpm test
+      - name: Build
+        run: pnpm build
+      - name: Package entry guard
+        if: inputs.package-entry-guard
+        run: node scripts/check-package-entry.mjs
+
+  install-smoke:
+    name: Published-package install smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+      - name: Enable corepack
+        run: corepack enable
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Install smoke test
+        if: inputs.install-smoke
+        run: node scripts/install-smoke.mjs
