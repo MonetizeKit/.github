@@ -100,6 +100,8 @@ jobs:
         run: corepack enable
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+      - name: Build
+        run: pnpm build
       - name: Install smoke test
         if: inputs.install-smoke
         run: node scripts/install-smoke.mjs
