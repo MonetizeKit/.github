@@ -1,0 +1,137 @@
+# Reusable SHADOW-MODE reviewer gate (Phase 2 of the SDLC plan).
+# Four batched lenses (Security, Testing, Internal Docs, External Docs) emit
+# the deterministic finding shape (schemas/review-findings.schema.json) as ONE
+# PR comment. Shadow mode: this workflow NEVER blocks — continue-on-error at
+# the caller, no required-check participation, and it self-skips green when
+# ANTHROPIC_API_KEY is absent (sync from Phase.dev to enable).
+#
+# Determinism contract: the model emits schema-constrained JSON; plain code
+# validates it and posts the comment. Prompt lives in this file — versioned,
+# changed only via reviewed PR. Bump PROMPT_VERSION on any prompt edit.
+name: Reusable PR Review (shadow)
+
+on:
+  workflow_call:
+    inputs:
+      model:
+        type: string
+        default: "claude-sonnet-5" # fixed model ID (no dated variant exists for this family)
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: false
+
+env:
+  PROMPT_VERSION: "1"
+
+jobs:
+  shadow-review:
+    name: Reviewer agents (shadow)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Check ANTHROPIC_API_KEY
+        id: key
+        run: |
+          if [ -z "${{ secrets.ANTHROPIC_API_KEY }}" ]; then
+            echo "::warning::ANTHROPIC_API_KEY is not set (sync from Phase.dev); skipping shadow review."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.key.outputs.present == 'true'
+        with:
+          fetch-depth: 0
+
+      - name: Fetch review schema
+        if: steps.key.outputs.present == 'true'
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/MonetizeKit/.github/v1/schemas/review-findings.schema.json \
+            -o /tmp/review-findings.schema.json
+
+      - name: Batched four-lens review
+        if: steps.key.outputs.present == 'true'
+        continue-on-error: true # shadow mode: agent failure never fails the workflow
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_args: "--model ${{ inputs.model }} --allowedTools Bash(git*),Read,Grep,Glob,Write"
+          prompt: |
+            You are the MonetizeKit shadow-mode PR reviewer running four lenses in one pass.
+            Review ONLY the diff of this pull request:
+              base: ${{ github.event.pull_request.base.sha }}
+              head: ${{ github.event.pull_request.head.sha }}
+            Use `git diff ${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}`
+            and read surrounding files for context as needed.
+
+            Lenses (evaluate each independently):
+            1. security — vulnerabilities, leaked secrets, unsafe patterns introduced by the diff.
+            2. testing — coverage and quality of tests added or missing for the changed behavior.
+            3. internal-docs — stale or missing internal documentation (README, AGENTS.md, runbooks) for the change.
+            4. external-docs — customer-facing docs / API references that this change makes stale.
+
+            Report every issue you find, including ones you are uncertain about or consider
+            low-severity. Do not filter for importance at this stage — a downstream filter
+            ranks findings. Include severity so it can. If a lens cannot be evaluated from
+            the available evidence, use verdict "insufficient-evidence" with an
+            escalation_reason — never guess.
+
+            Write EXACTLY one file, /tmp/review-findings.json, that validates against the
+            JSON Schema in /tmp/review-findings.schema.json. Set:
+              schema_version: 1
+              commit_sha: "${{ github.event.pull_request.head.sha }}"
+              model: "${{ inputs.model }}"
+              prompt_version: "${{ env.PROMPT_VERSION }}"
+              lenses: one entry per lens above, in that order.
+            Also write /tmp/review-summary.md: a short human-readable table of the findings
+            (or "No findings." per lens). Do not post comments yourself; the workflow does.
+
+      - name: Validate findings against schema
+        if: steps.key.outputs.present == 'true'
+        id: validate
+        run: |
+          if [ ! -s /tmp/review-findings.json ]; then
+            echo "::warning::Reviewer produced no findings file; posting failure note (shadow mode)."
+            echo "valid=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          npm install --no-save --no-audit --no-fund ajv-cli@5 ajv-formats@3 >/dev/null 2>&1
+          if npx ajv validate -c ajv-formats -s /tmp/review-findings.schema.json -d /tmp/review-findings.json; then
+            echo "valid=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Findings JSON failed schema validation (shadow mode)."
+            echo "valid=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post shadow verdict comment
+        if: steps.key.outputs.present == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "## 🕶️ Shadow reviewer verdict (advisory — does not block)"
+            echo ""
+            if [ "${{ steps.validate.outputs.valid }}" = "true" ]; then
+              cat /tmp/review-summary.md 2>/dev/null || echo "_Summary missing; findings JSON attached below._"
+              echo ""
+              echo "<details><summary>Structured findings (schema v1)</summary>"
+              echo ""
+              echo '```json'
+              cat /tmp/review-findings.json
+              echo '```'
+              echo "</details>"
+            else
+              echo "_Reviewer run failed or produced invalid output — counted against agent flakiness budget. No verdict this run._"
+            fi
+            echo ""
+            echo "_model: ${{ inputs.model }} · prompt v${{ env.PROMPT_VERSION }} · head: ${{ github.event.pull_request.head.sha }}_"
+            echo ""
+            echo "_React 👎 to any finding you dismiss — the scorecard collector counts acceptance._"
+          } > /tmp/comment.md
+          gh pr comment ${{ github.event.pull_request.number }} \
+            --repo ${{ github.repository }} \
+            --body-file /tmp/comment.md

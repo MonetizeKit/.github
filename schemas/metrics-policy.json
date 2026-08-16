@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "comment": "Versioned gate thresholds (determinism contract: code decides, agents inform). Changes to this file are reviewed commits.",
+  "reviewer_gate": {
+    "mode": "shadow",
+    "quorum_lenses": ["security", "testing", "internal-docs", "external-docs"],
+    "advisory_lenses": ["voice"],
+    "blocking_severities": ["critical", "high"],
+    "burn_in": {
+      "min_prs": 10,
+      "min_acceptance_rate": 0.6,
+      "max_false_block_rate": 0.1
+    }
+  },
+  "gate_agent": {
+    "mode": "not-yet-deployed",
+    "min_scores": {
+      "test_coverage": 60,
+      "security_posture": 70,
+      "blast_radius": 50,
+      "rollback_safety": 60
+    }
+  }
+}

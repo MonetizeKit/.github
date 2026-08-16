@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://monetizekit.com/schemas/review-findings.json",
+  "title": "MonetizeKit PR reviewer verdict (deterministic finding shape)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "commit_sha", "model", "prompt_version", "lenses"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "commit_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "model": { "type": "string", "minLength": 3 },
+    "prompt_version": { "type": "string", "minLength": 1 },
+    "lenses": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["lens", "verdict", "findings"],
+        "properties": {
+          "lens": {
+            "enum": ["security", "testing", "internal-docs", "external-docs", "voice"]
+          },
+          "verdict": {
+            "enum": ["pass", "findings", "insufficient-evidence"]
+          },
+          "escalation_reason": {
+            "type": "string",
+            "minLength": 20,
+            "description": "Required rationale when verdict is insufficient-evidence"
+          },
+          "findings": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["file", "severity", "problem", "remediation"],
+              "properties": {
+                "file": { "type": "string", "minLength": 1 },
+                "line": { "type": "integer", "minimum": 1 },
+                "severity": { "enum": ["critical", "high", "medium", "low"] },
+                "problem": { "type": "string", "minLength": 10 },
+                "remediation": { "type": "string", "minLength": 10 }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
