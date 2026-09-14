@@ -1,5 +1,5 @@
 {
-  "$schema": "./schemas/agent-policy.schema.json",
+  "$schema": "https://raw.githubusercontent.com/MonetizeKit/.github/v1/schemas/agent-policy.schema.json",
   "schema_version": 1,
   "policy_version": "1.0.0",
   "reviewed_at": "2026-09-14",
