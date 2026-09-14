@@ -1,27 +1,43 @@
-# Reusable SHADOW-MODE reviewer gate (Phase 2 of the SDLC plan).
-# Four batched lenses (Security, Testing, Internal Docs, External Docs) emit
-# the deterministic finding shape (schemas/review-findings.schema.json) as ONE
-# PR comment. Shadow mode: this workflow NEVER blocks — continue-on-error at
-# the caller, no required-check participation, and it self-skips green when
-# ANTHROPIC_API_KEY is absent (sync from Phase.dev to enable).
+# Reusable SHADOW-MODE reviewer gate.
+# Four batched lenses (Security, Testing, Internal Docs, External Docs), plus a
+# Compliance lens when the caller ships a REVIEW.md, emit the deterministic
+# finding shape (schemas/review-findings.schema.json) as ONE PR comment.
+# Shadow mode: this workflow NEVER blocks — continue-on-error at the caller, no
+# required-check participation, and it self-skips green when no credential is
+# present (sync ANTHROPIC_API_KEY or AI_GATEWAY_API_KEY from Phase.dev).
 #
 # Determinism contract: the model emits schema-constrained JSON; plain code
 # validates it and posts the comment. Prompt lives in this file — versioned,
 # changed only via reviewed PR. Bump PROMPT_VERSION on any prompt edit.
+#
+# Model, tools and route come from agent-policy.json (role: shadow-reviewer),
+# resolved at run time from `inputs.policy_ref` of this repository. Nothing in
+# this file pins a model ID.
 name: Reusable PR Review (shadow)
 
 on:
   workflow_call:
     inputs:
       model:
+        description: Override the policy model (canary experiments only; leave empty to follow agent-policy.json)
         type: string
-        default: "claude-sonnet-5" # fixed model ID (no dated variant exists for this family)
+        default: ""
+      policy_ref:
+        description: Ref of MonetizeKit/.github to read agent-policy.json and schemas from
+        type: string
+        default: "v1"
+      review_md:
+        description: Path (in the caller repo) of the review guide the reviewer must follow when present
+        type: string
+        default: "REVIEW.md"
     secrets:
       ANTHROPIC_API_KEY:
         required: false
+      AI_GATEWAY_API_KEY:
+        required: false
 
 env:
-  PROMPT_VERSION: "1"
+  PROMPT_VERSION: "2"
 
 jobs:
   shadow-review:
@@ -32,14 +48,47 @@ jobs:
       contents: read
       pull-requests: write
     steps:
-      - name: Check ANTHROPIC_API_KEY
-        id: key
+      - name: Fetch agent policy and schemas
+        id: policy-files
+        env:
+          POLICY_REF: ${{ inputs.policy_ref }}
         run: |
-          if [ -z "${{ secrets.ANTHROPIC_API_KEY }}" ]; then
-            echo "::warning::ANTHROPIC_API_KEY is not set (sync from Phase.dev); skipping shadow review."
-            echo "present=false" >> "$GITHUB_OUTPUT"
+          base="https://raw.githubusercontent.com/MonetizeKit/.github/${POLICY_REF}"
+          mkdir -p /tmp/policy
+          curl -fsSL "${base}/agent-policy.json" -o /tmp/policy/agent-policy.json
+          curl -fsSL "${base}/scripts/resolve-agent-policy.mjs" -o /tmp/policy/resolve-agent-policy.mjs
+          curl -fsSL "${base}/schemas/review-findings.schema.json" -o /tmp/review-findings.schema.json
+          echo "fetched agent-policy.json and schemas from ${POLICY_REF}"
+
+      - name: Resolve reviewer role from agent policy
+        id: role
+        env:
+          MODEL_OVERRIDE: ${{ inputs.model }}
+        run: |
+          node /tmp/policy/resolve-agent-policy.mjs --role shadow-reviewer --policy /tmp/policy/agent-policy.json
+          if [ -n "${MODEL_OVERRIDE}" ]; then
+            echo "::notice::Policy model overridden by caller input: ${MODEL_OVERRIDE}"
+            echo "bare=${MODEL_OVERRIDE#*/}" >> "$GITHUB_OUTPUT"
+            echo "model=${MODEL_OVERRIDE}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check credential for the resolved route
+        id: key
+        env:
+          ROUTE: ${{ steps.role.outputs.route }}
+          HAS_ANTHROPIC: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+          HAS_GATEWAY: ${{ secrets.AI_GATEWAY_API_KEY != '' }}
+        run: |
+          if [ "${ROUTE}" = "gateway" ] && [ "${HAS_GATEWAY}" = "true" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"; echo "use=gateway" >> "$GITHUB_OUTPUT"
+          elif [ "${HAS_ANTHROPIC}" = "true" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"; echo "use=anthropic" >> "$GITHUB_OUTPUT"
+          elif [ "${HAS_GATEWAY}" = "true" ]; then
+            echo "::notice::ANTHROPIC_API_KEY absent; using AI_GATEWAY_API_KEY through the gateway instead."
+            echo "present=true" >> "$GITHUB_OUTPUT"; echo "use=gateway" >> "$GITHUB_OUTPUT"
           else
-            echo "present=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::ANTHROPIC_API_KEY is not set (sync from Phase.dev); skipping shadow review."
+            echo "present=false" >> "$GITHUB_OUTPUT"; echo "use=none" >> "$GITHUB_OUTPUT"
           fi
 
       - uses: actions/checkout@v4
@@ -47,48 +96,69 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Fetch review schema
+      - name: Detect review guide
         if: steps.key.outputs.present == 'true'
+        id: guide
+        env:
+          REVIEW_MD: ${{ inputs.review_md }}
         run: |
-          curl -fsSL https://raw.githubusercontent.com/MonetizeKit/.github/v1/schemas/review-findings.schema.json \
-            -o /tmp/review-findings.schema.json
+          if [ -s "${REVIEW_MD}" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            echo "path=${GITHUB_WORKSPACE}/${REVIEW_MD}" >> "$GITHUB_OUTPUT"
+            echo "Review guide found at ${REVIEW_MD}; the reviewer must follow it."
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "path=" >> "$GITHUB_OUTPUT"
+            echo "No ${REVIEW_MD} in this repository; using default lenses only."
+          fi
 
-      - name: Batched four-lens review
+      - name: Batched lens review
         if: steps.key.outputs.present == 'true'
         continue-on-error: true # shadow mode: agent failure never fails the workflow
         uses: anthropics/claude-code-action@v1
+        env:
+          ANTHROPIC_BASE_URL: ${{ steps.key.outputs.use == 'gateway' && steps.role.outputs.anthropic_base_url || '' }}
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          claude_args: "--model ${{ inputs.model }} --allowedTools Bash(git*),Read,Grep,Glob,Write"
+          anthropic_api_key: ${{ steps.key.outputs.use == 'gateway' && secrets.AI_GATEWAY_API_KEY || secrets.ANTHROPIC_API_KEY }}
+          claude_args: "--model ${{ steps.role.outputs.bare }} --allowedTools ${{ steps.role.outputs.tools }}"
           prompt: |
-            You are the MonetizeKit shadow-mode PR reviewer running four lenses in one pass.
+            You are the MonetizeKit shadow-mode PR reviewer running batched lenses in one pass.
             Review ONLY the diff of this pull request:
               base: ${{ github.event.pull_request.base.sha }}
               head: ${{ github.event.pull_request.head.sha }}
             Use `git diff ${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}`
             and read surrounding files for context as needed.
 
-            Lenses (evaluate each independently):
+            Review guide: ${{ steps.guide.outputs.present == 'true' && format('READ {0} FIRST. It defines the passes to run, what counts as Important vs Nit, and paths you must not report on. Where it conflicts with the defaults below, the guide wins.', steps.guide.outputs.path) || 'This repository has no REVIEW.md; apply the default lenses below.' }}
+
+            Default lenses (evaluate each independently):
             1. security — vulnerabilities, leaked secrets, unsafe patterns introduced by the diff.
             2. testing — coverage and quality of tests added or missing for the changed behavior.
             3. internal-docs — stale or missing internal documentation (README, AGENTS.md, runbooks) for the change.
             4. external-docs — customer-facing docs / API references that this change makes stale.
+            5. compliance — ONLY when a review guide is present: does the change match the spec,
+               attestation or conventions the guide names? Omit this lens entirely otherwise.
 
             Report every issue you find, including ones you are uncertain about or consider
             low-severity. Do not filter for importance at this stage — a downstream filter
-            ranks findings. Include severity so it can. If a lens cannot be evaluated from
-            the available evidence, use verdict "insufficient-evidence" with an
-            escalation_reason — never guess.
+            ranks findings. Include severity so it can, and set label "important" for
+            critical/high and "nit" for medium/low. If a lens cannot be evaluated from the
+            available evidence, use verdict "insufficient-evidence" with an escalation_reason
+            — never guess. Never report on paths the review guide excludes, and never report
+            anything a required CI check already enforces deterministically.
 
             Write EXACTLY one file, /tmp/review-findings.json, that validates against the
             JSON Schema in /tmp/review-findings.schema.json. Set:
               schema_version: 1
               commit_sha: "${{ github.event.pull_request.head.sha }}"
-              model: "${{ inputs.model }}"
+              model: "${{ steps.role.outputs.model }}"
               prompt_version: "${{ env.PROMPT_VERSION }}"
+              policy_version: "${{ steps.role.outputs.policy_version }}"
               lenses: one entry per lens above, in that order.
             Also write /tmp/review-summary.md: a short human-readable table of the findings
-            (or "No findings." per lens). Do not post comments yourself; the workflow does.
+            grouped Important first, then at most five Nits (state how many more were
+            omitted), or "No findings." per lens. Do not post comments yourself; the
+            workflow does.
 
       - name: Validate findings against schema
         if: steps.key.outputs.present == 'true'
@@ -100,7 +170,7 @@ jobs:
             exit 0
           fi
           npm install --no-save --no-audit --no-fund ajv-cli@5 ajv-formats@3 >/dev/null 2>&1
-          if npx ajv validate -c ajv-formats -s /tmp/review-findings.schema.json -d /tmp/review-findings.json; then
+          if npx ajv validate --spec=draft2020 -c ajv-formats -s /tmp/review-findings.schema.json -d /tmp/review-findings.json; then
             echo "valid=true" >> "$GITHUB_OUTPUT"
           else
             echo "::warning::Findings JSON failed schema validation (shadow mode)."
@@ -111,6 +181,9 @@ jobs:
         if: steps.key.outputs.present == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          MODEL: ${{ steps.role.outputs.model }}
+          POLICY_VERSION: ${{ steps.role.outputs.policy_version }}
+          GUIDE_PRESENT: ${{ steps.guide.outputs.present }}
         run: |
           {
             echo "## 🕶️ Shadow reviewer verdict (advisory — does not block)"
@@ -128,9 +201,11 @@ jobs:
               echo "_Reviewer run failed or produced invalid output — counted against agent flakiness budget. No verdict this run._"
             fi
             echo ""
-            echo "_model: ${{ inputs.model }} · prompt v${{ env.PROMPT_VERSION }} · head: ${{ github.event.pull_request.head.sha }}_"
+            guide_note="no REVIEW.md"
+            if [ "${GUIDE_PRESENT}" = "true" ]; then guide_note="REVIEW.md applied"; fi
+            echo "_model: ${MODEL} · prompt v${{ env.PROMPT_VERSION }} · policy v${POLICY_VERSION} · ${guide_note} · head: ${{ github.event.pull_request.head.sha }}_"
             echo ""
-            echo "_React 👎 to any finding you dismiss — the scorecard collector counts acceptance._"
+            echo "_React 👎 to any finding you dismiss — the SDLC metrics scorecard counts acceptance._"
           } > /tmp/comment.md
           gh pr comment ${{ github.event.pull_request.number }} \
             --repo ${{ github.repository }} \
