@@ -1,0 +1,182 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/MonetizeKit/.github/v1/schemas/agent-policy.schema.json",
+  "title": "MonetizeKit agent policy",
+  "description": "Single source of truth for every agent role in the fleet: which model runs it, through which route, with which tools, over which data, how autonomously per environment, and who owns it. Workflows and applications resolve model IDs from this file; nothing else may pin one.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "policy_version", "reviewed_at", "review_due", "gateway", "tiers", "roles"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "schema_version": { "const": 1 },
+    "policy_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
+      "description": "Bumped on every change. Consumers print it beside their output so a finding can be traced to the policy that produced it."
+    },
+    "reviewed_at": { "type": "string", "format": "date" },
+    "review_due": {
+      "type": "string",
+      "format": "date",
+      "description": "The model-usage maintenance loop opens a model-usage-drift issue when this date has passed."
+    },
+    "gateway": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "models_endpoint", "credential_env"],
+      "properties": {
+        "provider": { "const": "vercel-ai-gateway" },
+        "base_url": { "type": "string", "format": "uri" },
+        "models_endpoint": { "type": "string", "format": "uri" },
+        "credential_env": { "type": "string" },
+        "anthropic_compatible_base_url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Base URL callers export as ANTHROPIC_BASE_URL when a role's route is gateway and the runtime speaks the Anthropic API (claude-code-action, claude -p)."
+        }
+      }
+    },
+    "tiers": {
+      "type": "object",
+      "description": "Named cost tiers. A role references a tier so the model-usage loop can tell 'we chose the cheap tier' from 'we forgot to upgrade'.",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["purpose", "model", "fallback"],
+        "properties": {
+          "purpose": { "type": "string" },
+          "model": { "$ref": "#/$defs/modelId" },
+          "fallback": { "$ref": "#/$defs/modelId" }
+        }
+      }
+    },
+    "roles": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "pattern": "^[a-z][a-z0-9-]*(:[a-z][a-z0-9-]*)?$" },
+      "additionalProperties": { "$ref": "#/$defs/role" }
+    }
+  },
+  "$defs": {
+    "modelId": {
+      "type": "string",
+      "pattern": "^(anthropic|openai|google|xai|mistral)/[a-z0-9][a-z0-9.-]*$",
+      "description": "Gateway-style model ID (provider/model). Callers that speak a provider API directly strip the provider prefix with the resolver's `bare` output."
+    },
+    "environment": { "type": "string", "enum": ["development", "delivery", "production"] },
+    "autonomy": {
+      "type": "string",
+      "enum": ["act", "propose", "prepare-only", "read-only", "none"],
+      "description": "act: may change state (merge, deploy, write) without a human. propose: opens a PR or issue a human accepts. prepare-only: assembles evidence and drafts, never opens or changes anything. read-only: observes and reports. none: does not run in this environment."
+    },
+    "dataClass": {
+      "type": "string",
+      "enum": ["public", "internal", "secrets-redacted", "customer-content", "customer-pii"],
+      "description": "customer-pii is never permitted for a model role; it exists so a violation is expressible and therefore testable."
+    },
+    "role": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["description", "model_selection", "route", "tools", "data_classes", "autonomy", "human_gate", "owner", "surfaces"],
+      "properties": {
+        "description": { "type": "string", "minLength": 20 },
+        "model_selection": {
+          "type": "string",
+          "enum": ["policy", "operator", "none"],
+          "description": "policy: the model below is mandatory. operator: an interactive session chooses its own model; this policy governs only tools, data and autonomy. none: deterministic role, no model."
+        },
+        "tier": { "type": "string" },
+        "model": { "$ref": "#/$defs/modelId" },
+        "fallback": { "$ref": "#/$defs/modelId" },
+        "quorum": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["required", "models"],
+          "properties": {
+            "required": { "type": "boolean" },
+            "models": {
+              "type": "array",
+              "minItems": 2,
+              "uniqueItems": true,
+              "items": { "$ref": "#/$defs/modelId" },
+              "description": "All listed models must agree for the role to approve; they must span at least two providers."
+            }
+          }
+        },
+        "route": {
+          "type": "string",
+          "enum": ["gateway", "direct-anthropic", "cursor-cloud-agent", "none"],
+          "description": "gateway: AI_GATEWAY_API_KEY through the Vercel AI Gateway. direct-anthropic: ANTHROPIC_API_KEY. cursor-cloud-agent: launched as a Cursor Cloud Agent or Automation (credential and model managed there). none: deterministic."
+        },
+        "budget": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "max_usd_per_run": { "type": "number", "minimum": 0 },
+            "max_output_tokens": { "type": "integer", "minimum": 1 },
+            "max_runs_per_day": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "tools": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string" },
+          "description": "Allowed tool patterns in claude-code-action syntax, e.g. Bash(git*), Read, Grep, Glob, Write. Empty means the role has no tool access (pure completion)."
+        },
+        "data_classes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/dataClass" }
+        },
+        "autonomy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["development", "delivery", "production"],
+          "properties": {
+            "development": { "$ref": "#/$defs/autonomy" },
+            "delivery": { "$ref": "#/$defs/autonomy" },
+            "production": { "$ref": "#/$defs/autonomy" }
+          }
+        },
+        "human_gate": {
+          "type": "boolean",
+          "description": "True when a human must accept this role's output before it has effect. Required true for any role whose production autonomy is above read-only."
+        },
+        "owner": { "type": "string", "pattern": "^(@[A-Za-z0-9-]+(/[A-Za-z0-9-]+)?|[^@\\s]+@[^@\\s]+)$" },
+        "surfaces": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" },
+          "description": "Where this role is consumed: repo-relative paths (repo:path) so the model-usage loop can find every consumer."
+        },
+        "status": { "type": "string", "enum": ["active", "shadow", "planned", "retired"], "default": "active" },
+        "prompt_version_env": {
+          "type": "string",
+          "description": "Environment variable that carries the prompt version in the consuming workflow (checked by model-watch for bump hygiene)."
+        },
+        "evals_fixture": {
+          "type": "string",
+          "description": "Path to the agent-evals fixture that exercises this role; model-watch flags a policy role with none."
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "model_selection": { "const": "policy" } } },
+          "then": { "required": ["model", "fallback", "tier"] }
+        },
+        {
+          "if": { "properties": { "model_selection": { "const": "none" } } },
+          "then": { "properties": { "route": { "const": "none" } }, "not": { "required": ["model"] } }
+        },
+        {
+          "if": { "properties": { "autonomy": { "type": "object", "properties": { "production": { "enum": ["act", "propose", "prepare-only"] } } } } },
+          "then": { "properties": { "human_gate": { "const": true } } }
+        },
+        {
+          "not": { "properties": { "data_classes": { "type": "array", "contains": { "const": "customer-pii" } }, "model_selection": { "enum": ["policy", "operator"] } }, "required": ["data_classes", "model_selection"] }
+        }
+      ]
+    }
+  }
+}
