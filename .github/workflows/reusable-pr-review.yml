@@ -87,7 +87,7 @@ jobs:
             echo "::notice::ANTHROPIC_API_KEY absent; using AI_GATEWAY_API_KEY through the gateway instead."
             echo "present=true" >> "$GITHUB_OUTPUT"; echo "use=gateway" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::ANTHROPIC_API_KEY is not set (sync from Phase.dev); skipping shadow review."
+            echo "::warning::Neither AI_GATEWAY_API_KEY nor ANTHROPIC_API_KEY is set (sync from Phase.dev); skipping shadow review."
             echo "present=false" >> "$GITHUB_OUTPUT"; echo "use=none" >> "$GITHUB_OUTPUT"
           fi
 
