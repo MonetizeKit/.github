@@ -338,7 +338,7 @@
       "autonomy": { "development": "read-only", "delivery": "read-only", "production": "read-only" },
       "human_gate": false,
       "owner": "@EtherealVisions",
-      "surfaces": ["app-monetizekit-monorepo:scripts/sdlc-metrics/classify.mjs"],
+      "surfaces": ["app-monetizekit-monorepo:scripts/sdlc-metrics/lib/classify.mjs"],
       "status": "active"
     }
   }
