@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/MonetizeKit/.github/v1/schemas/agent-policy.schema.json",
   "schema_version": 1,
-  "policy_version": "1.1.0",
+  "policy_version": "1.2.0",
   "reviewed_at": "2026-09-14",
   "review_due": "2026-12-14",
   "gateway": {
@@ -180,6 +180,23 @@
       "human_gate": true,
       "owner": "@EtherealVisions",
       "surfaces": ["app-monetizekit-monorepo:.github/docs-impact-approval-policy.json", "app-monetizekit-monorepo:scripts/docs/review-content-impact-with-llm.mjs", "app-monetizekit-monorepo:.github/workflows/ci-docs-validation.yml"],
+      "status": "active"
+    },
+    "promotion-docs-review": {
+      "description": "Advisory whole-range docs review of a promotion PR (development -> delivery, delivery -> main). Reads the complete base..head implementation diff and affected prose with no attestation input, unions both providers' findings into the job summary and never gates: each feature's attestation was countersigned on its own PR; this catches interactions between them.",
+      "model_selection": "policy",
+      "tier": "judgment",
+      "model": "anthropic/claude-opus-4.8",
+      "fallback": "anthropic/claude-opus-5",
+      "quorum": { "required": false, "models": ["anthropic/claude-opus-4.8", "openai/gpt-5.5"] },
+      "route": "gateway",
+      "budget": { "max_usd_per_run": 3.0, "max_output_tokens": 8000 },
+      "tools": [],
+      "data_classes": ["public", "internal"],
+      "autonomy": { "development": "propose", "delivery": "propose", "production": "propose" },
+      "human_gate": true,
+      "owner": "@EtherealVisions",
+      "surfaces": ["app-monetizekit-monorepo:scripts/docs/review-promotion-range-with-llm.mjs", "app-monetizekit-monorepo:.github/workflows/ci-docs-validation.yml"],
       "status": "active"
     },
     "build-failure-triage": {
