@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://monetizekit.com/schemas/stage-review.json",
+  "title": "MonetizeKit Stage Review lens catalog (.github/stage-review.json)",
+  "description": "Per-repository catalog of review lenses for the batched model review of a stage head. Each lens names a policy role (agent-policy.json), the deterministic partners that run first, the paths it judges and its graduation mode. Plain code turns lens results into the check-run verdict; the model only informs.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "stage", "base", "check_name", "blocking_labels", "partners", "lenses"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "version": { "const": 1 },
+    "stage": { "type": "string", "enum": ["development", "delivery"] },
+    "base": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Branch the stage promotes into; the review range is base..head"
+    },
+    "check_name": { "type": "string", "pattern": "^Stage Review / (development|delivery)$" },
+    "blocking_labels": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "enum": ["important", "nit"] },
+      "description": "Finding labels that fail a lens in gate mode; nit never blocks by policy"
+    },
+    "partners": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "title"],
+        "properties": {
+          "kind": {
+            "enum": ["script", "job", "upstream"],
+            "description": "script: run by run-partners.mjs, emits a partner report; job: a workflow job in stage-review.yml (e.g. CodeQL); upstream: an existing required check or observing loop cited as evidence"
+          },
+          "title": { "type": "string", "minLength": 10 },
+          "run": { "type": "string", "minLength": 1, "description": "Command for kind=script" },
+          "job": { "type": "string", "minLength": 1, "description": "Job id in stage-review.yml for kind=job" },
+          "check": { "type": "string", "minLength": 1, "description": "Check-run name for kind=upstream" },
+          "workflow": { "type": "string", "pattern": "\\.ya?ml$", "description": "Workflow file for kind=upstream loops" }
+        },
+        "allOf": [
+          { "if": { "properties": { "kind": { "const": "script" } } }, "then": { "required": ["run"] } },
+          { "if": { "properties": { "kind": { "const": "job" } } }, "then": { "required": ["job"] } },
+          {
+            "if": { "properties": { "kind": { "const": "upstream" } } },
+            "then": { "anyOf": [{ "required": ["check"] }, { "required": ["workflow"] }] }
+          }
+        ]
+      }
+    },
+    "lenses": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "title", "role", "mode", "paths", "partners", "judges"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+          "title": { "type": "string", "minLength": 3 },
+          "role": {
+            "type": "string",
+            "pattern": "^stage-review(:[a-z][a-z0-9-]*)?$",
+            "description": "agent-policy.json role whose model reviews this lens"
+          },
+          "mode": {
+            "enum": ["planned", "shadow", "gate"],
+            "description": "planned: partners only, model not asked; shadow: model asked, never blocks; gate: important findings fail the check"
+          },
+          "paths": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 },
+            "description": "Globs; the lens is in scope when any changed file matches. Empty = every change."
+          },
+          "partners": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "minLength": 1 },
+            "description": "Partner ids; every lens pairs with at least one deterministic partner"
+          },
+          "judges": {
+            "type": "string",
+            "minLength": 40,
+            "description": "What the model judges that code cannot; injected into the prompt verbatim"
+          },
+          "never_report": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 },
+            "description": "Things a required check already enforces; the model must not report them"
+          },
+          "graduated_at": {
+            "type": "string",
+            "format": "date",
+            "description": "Date the lens moved to gate mode (required when mode is gate)"
+          }
+        },
+        "if": { "properties": { "mode": { "const": "gate" } } },
+        "then": { "required": ["graduated_at"] }
+      }
+    }
+  }
+}
