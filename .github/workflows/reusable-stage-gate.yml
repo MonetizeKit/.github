@@ -1,0 +1,121 @@
+# Reusable Stage Gate.
+#
+# Aggregates every loop that can observe a stage branch (`development` or
+# `delivery`) into ONE check run on the stage head — `Stage Gate / <stage>` —
+# so promotion waits on all observers, not on the docs loop alone. Which loops
+# count is declared in the caller's `.github/stage-gate.json`
+# (schemas/stage-gate.schema.json); this workflow only evaluates and publishes.
+#
+# Semantics (scripts/stage-gate/evaluate.mjs):
+#   required signal failed        -> check run completed/failure
+#   required signal not reported  -> check run in_progress (pending)
+#   otherwise                     -> check run completed/success
+#   advisory signal (required:false) -> reported in the summary, never gates
+#
+# The caller re-runs this whenever an observer completes (`workflow_run`), on a
+# short schedule for observers in other repositories, on drift-issue closure,
+# and by hand. Each evaluation publishes a fresh check run; the newest one is
+# the verdict `reusable-promote.yml` reads.
+name: Reusable Stage Gate
+
+on:
+  workflow_call:
+    inputs:
+      stage:
+        description: Stage branch to gate (development | delivery)
+        type: string
+        required: true
+      config_path:
+        description: Path (in the caller repo) of the stage-gate configuration
+        type: string
+        default: ".github/stage-gate.json"
+      sha:
+        description: Evaluate this commit instead of the current stage head (dry runs)
+        type: string
+        default: ""
+      publish:
+        description: Publish the `Stage Gate / <stage>` check run (false = evaluate and report only)
+        type: boolean
+        default: true
+      policy_ref:
+        description: Ref of MonetizeKit/.github to read the evaluator from
+        type: string
+        default: "v1"
+    secrets:
+      GH_PAT:
+        description: Token able to read other fleet repositories (private members such as app-monetizekit-web); falls back to GITHUB_TOKEN
+        required: false
+    outputs:
+      conclusion:
+        description: success | failure | pending
+        value: ${{ jobs.evaluate.outputs.conclusion }}
+      sha:
+        description: The stage head that was evaluated
+        value: ${{ jobs.evaluate.outputs.sha }}
+
+jobs:
+  evaluate:
+    name: Stage Gate / ${{ inputs.stage }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+      actions: read
+      issues: read
+    outputs:
+      conclusion: ${{ steps.gate.outputs.conclusion }}
+      sha: ${{ steps.gate.outputs.sha }}
+    steps:
+      - name: Validate stage input
+        env:
+          STAGE: ${{ inputs.stage }}
+        run: |
+          case "$STAGE" in
+            development|delivery) echo "stage=$STAGE" ;;
+            *) echo "::error::stage must be development or delivery, got '$STAGE'"; exit 1 ;;
+          esac
+
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            ${{ inputs.config_path }}
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Fetch the stage-gate evaluator
+        env:
+          POLICY_REF: ${{ inputs.policy_ref }}
+        run: |
+          base="https://raw.githubusercontent.com/MonetizeKit/.github/${POLICY_REF}"
+          mkdir -p /tmp/stage-gate
+          curl -fsSL "${base}/scripts/stage-gate/evaluate.mjs" -o /tmp/stage-gate/evaluate.mjs
+          curl -fsSL "${base}/schemas/stage-gate.schema.json" -o /tmp/stage-gate/stage-gate.schema.json
+          echo "fetched evaluate.mjs from ${POLICY_REF}"
+
+      - name: Evaluate and publish
+        id: gate
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          STAGE: ${{ inputs.stage }}
+          CONFIG_PATH: ${{ inputs.config_path }}
+          SHA: ${{ inputs.sha }}
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          args=(--repo "$GITHUB_REPOSITORY" --stage "$STAGE" --config "$CONFIG_PATH" --out ".artifacts/stage-gate/${STAGE}.json")
+          if [ -n "$SHA" ]; then args+=(--sha "$SHA"); fi
+          if [ "$PUBLISH" = "true" ]; then args+=(--publish); fi
+          node /tmp/stage-gate/evaluate.mjs "${args[@]}"
+
+      - name: Upload gate evidence
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stage-gate-${{ inputs.stage }}-${{ steps.gate.outputs.sha || github.run_id }}
+          path: .artifacts/stage-gate/
+          if-no-files-found: warn
+          retention-days: 30

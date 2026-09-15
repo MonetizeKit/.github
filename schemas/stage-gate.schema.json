@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/MonetizeKit/.github/v1/schemas/stage-gate.schema.json",
+  "title": "MonetizeKit stage gate configuration",
+  "description": "Declares, per stage branch, the observing loops whose verdict on the stage head must hold before the stage may be promoted. Evaluated by scripts/stage-gate/evaluate.mjs, which publishes one `Stage Gate / <stage>` check run on the stage SHA.",
+  "type": "object",
+  "required": ["stages"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "description": { "type": "string" },
+    "stages": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "development": { "$ref": "#/$defs/stage" },
+        "delivery": { "$ref": "#/$defs/stage" }
+      }
+    }
+  },
+  "$defs": {
+    "stage": {
+      "type": "object",
+      "required": ["base", "signals"],
+      "additionalProperties": false,
+      "properties": {
+        "base": {
+          "type": "string",
+          "description": "The branch this stage promotes into; drift-clear ranges are `base..<stage head>`.",
+          "enum": ["delivery", "main"]
+        },
+        "signals": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/signal" }
+        }
+      }
+    },
+    "signalBase": {
+      "type": "object",
+      "required": ["id", "title", "type"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+        "title": { "type": "string", "minLength": 3 },
+        "loop": { "type": "string", "description": "The peripheral loop this signal represents, as named in the roadmap loop inventory." },
+        "required": { "type": "boolean", "default": true, "description": "false = advisory: reported in the summary, never moves the conclusion (shadow mode)." },
+        "repo": { "type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", "description": "OWNER/REPO to read from; defaults to the repository being gated." }
+      }
+    },
+    "signal": {
+      "oneOf": [
+        {
+          "allOf": [
+            { "$ref": "#/$defs/signalBase" },
+            {
+              "type": "object",
+              "required": ["type", "name"],
+              "properties": {
+                "type": { "const": "check-run" },
+                "name": { "type": "string", "description": "Exact check run name expected on the stage SHA." }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/signalBase" },
+            {
+              "type": "object",
+              "required": ["type", "workflow"],
+              "properties": {
+                "type": { "const": "workflow-run" },
+                "workflow": { "type": "string", "pattern": "\\.ya?ml$", "description": "Workflow file name in the target repository." },
+                "branch": { "type": "string" },
+                "event": { "type": "string" },
+                "maxAgeHours": { "type": "number", "exclusiveMinimum": 0, "default": 36, "description": "A completed run older than this means the loop is not observing the stage." },
+                "afterHead": { "type": "boolean", "default": false, "description": "Require the run to have started after the stage head landed (one soak cycle)." },
+                "absent": { "type": "string", "enum": ["pending", "skip"], "default": "pending", "description": "What a loop with no recent run means: pending blocks; skip records `not observing` and does not block (for schedules gated by a repository variable)." }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/signalBase" },
+            {
+              "type": "object",
+              "required": ["type", "repo", "branch"],
+              "properties": {
+                "type": { "const": "branch-head" },
+                "branch": { "type": "string" },
+                "check": { "type": "string", "default": "Required Checks Gate" }
+              }
+            }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/signalBase" },
+            {
+              "type": "object",
+              "required": ["type", "labels"],
+              "properties": {
+                "type": { "const": "drift-clear" },
+                "labels": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+                "mode": { "type": "string", "enum": ["cites-range", "any-open"], "default": "cites-range" }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  }
+}
