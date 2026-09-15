@@ -1,0 +1,56 @@
+# Reusable promotion-guard.
+#
+# Emits the `promotion-guard` check on every pull request into `delivery` or
+# `main`: it passes only when the head is the stage directly upstream
+# (`development` -> `delivery`, `delivery` -> `main`). A feature branch aimed at
+# `main` fails, so the only route to production is the promotion chain and no
+# stage's observers are skipped. `promotion-override` passes an audited hotfix
+# with a warning; `sdlc-metrics` counts those.
+#
+# Call from a `pull_request` workflow with `branches: [delivery, main]` and add
+# `promotion-guard` to branch protection on both branches.
+name: Reusable promotion-guard
+
+on:
+  workflow_call:
+    inputs:
+      policy_ref:
+        description: Ref of MonetizeKit/.github to read the guard from
+        type: string
+        default: "v1"
+    outputs:
+      pass:
+        description: "true when the PR is the expected hop or an audited override"
+        value: ${{ jobs.guard.outputs.pass }}
+      override:
+        description: "true when the promotion-override label allowed a non-chain PR"
+        value: ${{ jobs.guard.outputs.override }}
+
+jobs:
+  guard:
+    name: promotion-guard
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      pass: ${{ steps.guard.outputs.pass }}
+      override: ${{ steps.guard.outputs.override }}
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Fetch the guard
+        env:
+          POLICY_REF: ${{ inputs.policy_ref }}
+        run: |
+          mkdir -p /tmp/promote
+          curl -fsSL "https://raw.githubusercontent.com/MonetizeKit/.github/${POLICY_REF}/scripts/promote/guard.mjs" -o /tmp/promote/guard.mjs
+
+      - name: Check the hop
+        id: guard
+        env:
+          GITHUB_BASE_REF: ${{ github.base_ref }}
+          GITHUB_HEAD_REF: ${{ github.head_ref }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: node /tmp/promote/guard.mjs

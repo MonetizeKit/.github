@@ -1,0 +1,168 @@
+# Reusable Promote — one hop of the promotion chain.
+#
+#   development -> delivery   automatic: open/update the promotion PR when
+#                             `Stage Gate / development` is green on the
+#                             development head and enable auto-merge. GitHub
+#                             merges it when required checks pass.
+#   delivery -> main          prepared, human-authorized: open/update the PR
+#                             with the changelog draft, the loop-by-loop gate
+#                             evidence and the review findings across the
+#                             included feature PRs when `Stage Gate / delivery`
+#                             is green (+ optional soak). Never merges — a
+#                             code-owner approval on main is the release gate.
+#
+# The bot (scripts/promote/run.mjs, agent-policy role `promotion-bot`) reads
+# the stage gate check run and nothing else. It has no route to main: the
+# workflow token cannot bypass branch protection, and `reusable-promotion-guard`
+# fails any PR into delivery/main that is not the expected upstream stage.
+#
+# The PR is opened with GH_PAT (a user/app token) because a PR opened with the
+# workflow's own GITHUB_TOKEN triggers no workflows — its required checks would
+# never report and auto-merge could never complete. Without GH_PAT the step
+# still runs but warns.
+#
+# Callers run this on `workflow_run` of their Stage Gate (completed), on a
+# short schedule (soak expiry; observers in other repos), and by hand.
+name: Reusable Promote
+
+on:
+  workflow_call:
+    inputs:
+      source:
+        description: Stage branch to promote from (development | delivery)
+        type: string
+        required: true
+      gate_check:
+        description: Check-run name that must be green on the source head (default "Stage Gate / <source>")
+        type: string
+        default: ""
+      soak_minutes:
+        description: Extra minutes the gate must have been green before promoting (delivery -> main soak)
+        type: number
+        default: 0
+      auto_merge:
+        description: Enable auto-merge on the promotion PR (development -> delivery only)
+        type: boolean
+        default: false
+      changelog_command:
+        description: Shell command run in the caller checkout whose stdout becomes the PR's changelog section (SOURCE/TARGET env vars available)
+        type: string
+        default: ""
+      dry_run:
+        description: Compute and report only; open no PR
+        type: boolean
+        default: false
+      policy_ref:
+        description: Ref of MonetizeKit/.github to read the bot from
+        type: string
+        default: "v1"
+    secrets:
+      GH_PAT:
+        description: User/app token that opens the PR so its CI runs; falls back to GITHUB_TOKEN with a warning
+        required: false
+    outputs:
+      status:
+        description: nothing-to-promote | gate-pending | gate-red | gate-soaking | opened | updated | dry-run
+        value: ${{ jobs.promote.outputs.status }}
+      pr_url:
+        description: URL of the promotion PR when one was opened or updated
+        value: ${{ jobs.promote.outputs.pr_url }}
+
+jobs:
+  promote:
+    name: Promote ${{ inputs.source }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    outputs:
+      status: ${{ steps.promote.outputs.status }}
+      pr_url: ${{ steps.promote.outputs.pr_url }}
+    steps:
+      - name: Resolve the hop
+        id: hop
+        env:
+          SOURCE: ${{ inputs.source }}
+          GATE_INPUT: ${{ inputs.gate_check }}
+          AUTO_MERGE: ${{ inputs.auto_merge }}
+        run: |
+          case "$SOURCE" in
+            development) target=delivery ;;
+            delivery) target=main ;;
+            *) echo "::error::source must be development or delivery, got '$SOURCE'"; exit 1 ;;
+          esac
+          if [ "$target" = "main" ] && [ "$AUTO_MERGE" = "true" ]; then
+            echo "::error::auto_merge is not allowed for delivery -> main; that hop is human-authorized by design"
+            exit 1
+          fi
+          gate="$GATE_INPUT"
+          if [ -z "$gate" ]; then gate="Stage Gate / $SOURCE"; fi
+          {
+            echo "target=$target"
+            echo "gate=$gate"
+          } >> "$GITHUB_OUTPUT"
+          echo "hop: $SOURCE -> $target, gate '$gate'"
+
+      - uses: actions/checkout@v4
+        if: inputs.changelog_command != ''
+        with:
+          ref: ${{ inputs.source }}
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Fetch the promotion bot
+        env:
+          POLICY_REF: ${{ inputs.policy_ref }}
+        run: |
+          base="https://raw.githubusercontent.com/MonetizeKit/.github/${POLICY_REF}"
+          mkdir -p /tmp/promote
+          curl -fsSL "${base}/scripts/promote/run.mjs" -o /tmp/promote/run.mjs
+          echo "fetched run.mjs from ${POLICY_REF}"
+
+      - name: Draft the changelog for the range
+        if: inputs.changelog_command != ''
+        env:
+          SOURCE: ${{ inputs.source }}
+          TARGET: ${{ steps.hop.outputs.target }}
+          CHANGELOG_COMMAND: ${{ inputs.changelog_command }}
+        run: |
+          git fetch --no-tags origin "$TARGET" "$SOURCE" >/dev/null 2>&1 || true
+          if bash -c "$CHANGELOG_COMMAND" > /tmp/promote/changelog.md 2> /tmp/promote/changelog.err; then
+            echo "changelog draft: $(wc -c < /tmp/promote/changelog.md) bytes"
+          else
+            echo "::warning::changelog command failed; promoting without a changelog section"
+            cat /tmp/promote/changelog.err
+            : > /tmp/promote/changelog.md
+          fi
+
+      - name: Open or update the promotion PR
+        id: promote
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SOURCE: ${{ inputs.source }}
+          TARGET: ${{ steps.hop.outputs.target }}
+          GATE: ${{ steps.hop.outputs.gate }}
+          SOAK: ${{ inputs.soak_minutes }}
+          AUTO_MERGE: ${{ inputs.auto_merge }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          HAS_CHANGELOG: ${{ inputs.changelog_command != '' }}
+        run: |
+          args=(--repo "$GITHUB_REPOSITORY" --source "$SOURCE" --target "$TARGET" --gate "$GATE" --soak-minutes "$SOAK" --out ".artifacts/promote/${SOURCE}.json")
+          if [ "$AUTO_MERGE" = "true" ]; then args+=(--auto-merge); fi
+          if [ "$DRY_RUN" = "true" ]; then args+=(--dry-run); fi
+          if [ "$HAS_CHANGELOG" = "true" ] && [ -s /tmp/promote/changelog.md ]; then args+=(--changelog-file /tmp/promote/changelog.md); fi
+          node /tmp/promote/run.mjs "${args[@]}"
+
+      - name: Upload promotion evidence
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: promote-${{ inputs.source }}-${{ steps.promote.outputs.sha || github.run_id }}
+          path: .artifacts/promote/
+          if-no-files-found: ignore
+          retention-days: 30

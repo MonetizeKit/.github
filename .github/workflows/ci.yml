@@ -22,7 +22,7 @@ jobs:
         with:
           node-version: "22"
       - name: Unit tests (node:test)
-        run: node --test scripts/stage-gate/evaluate.test.mjs
+        run: node --test scripts/stage-gate/evaluate.test.mjs scripts/promote/promote.test.mjs
       - name: Policy and schema files parse
         run: |
           for file in agent-policy.json schemas/*.json ops/*.json; do
