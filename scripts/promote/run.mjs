@@ -410,8 +410,15 @@ export async function promote({ api, repo, source, target, gateName, gateWorkflo
   const gate = gateState(trusted.verdict, { soakMinutes, now, soakFrom: landedAt });
   gate.verdict = trusted.verdict;
   if (trusted.verdict) {
-    const checks = await api.getJson(repo, `/commits/${headSha}/check-runs`, { check_name: gateName, per_page: 50 });
-    gate.display = displayCheckRun(checks?.check_runs, { stage: source, runId: trusted.verdict.runId });
+    // Display only. Reading check runs needs `checks: read`, which private
+    // repositories' callers may not grant; the decision never depends on it.
+    try {
+      const checks = await api.getJson(repo, `/commits/${headSha}/check-runs`, { check_name: gateName, per_page: 50 });
+      gate.display = displayCheckRun(checks?.check_runs, { stage: source, runId: trusted.verdict.runId });
+    } catch (error) {
+      gate.display = null;
+      result.displayWarning = `could not read the ${gateName} check run for its summary (${String(error.message).slice(0, 120)}); the verdict is unaffected`;
+    }
   }
   result.gate = {
     state: gate.state,
@@ -529,6 +536,7 @@ async function main() {
   const { body, ...printable } = result;
   console.log(JSON.stringify(printable, null, 2));
   if (result.warning) console.log(`::warning::${result.warning}`);
+  if (result.displayWarning) console.log(`::notice::${result.displayWarning}`);
   if (args.out) {
     mkdirSync(path.dirname(args.out), { recursive: true });
     writeFileSync(args.out, `${JSON.stringify(result, null, 2)}\n`);
