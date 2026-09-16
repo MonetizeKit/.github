@@ -24,8 +24,9 @@
 # the default branch rather than the calling ref (a PR branch cannot weaken
 # it), and the evidence artifact is named `stage-gate-<stage>-<sha>-<conclusion>`
 # — the promotion bot reads its verdict from the newest such artifact across
-# this workflow's default-branch runs, never from the check run. Observer check
-# runs are likewise bound to the Actions job that produced them (evaluate.mjs).
+# this workflow's default-branch runs, never from the check run. Observer
+# verdicts are likewise read from the newest run of each signal's pinned
+# workflow for the stage SHA and its job, never from check runs (evaluate.mjs).
 name: Reusable Stage Gate
 
 on:

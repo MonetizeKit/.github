@@ -21,24 +21,20 @@
 // that has not reported yet leaves the gate `in_progress` (pending); anything
 // else is `success`.
 //
-// Observer check runs are bound, not trusted by name. Any workflow with
-// `checks: write` can mint a check run under any name on the stage SHA, so a
-// `check-run`/`branch-head` signal is honored only when the check run is a
-// GitHub Actions *job* (details_url `/actions/runs/<run>/job/<job>`) whose job
-// object — which only GitHub writes — has this SHA and this name, and whose
-// workflow run is a run of exactly the declared `workflow` path, from this
-// repository's own code (not a fork, not a pull_request event), for this SHA.
-// Pinning the path is what stops a second workflow with a same-named job from
-// standing in for the observer: only someone who can change the observer
-// workflow file itself can change its verdict, which is the CI trust boundary
-// anyway. The job's status/conclusion is the verdict, not the check run's. A
-// check run that cannot be bound (published via the API, or pointing at a job
-// for another SHA) counts as *not reported*: it keeps a required signal pending
-// and never passes or fails it. `workflow-run` signals likewise count only runs
-// of exactly `.github/workflows/<workflow>` from the target repository's own
-// code on its default branch (or the declared `branch`), so a stub of the
-// observer on a feature branch is not an observation. Advisory signals (`required: false`) are reported in the
-// summary and never move the conclusion — that is the shadow → gate path.
+// Observer verdicts are read from workflow runs, never from check runs. Any
+// workflow with `checks: write` can mint a check run under any name on the
+// stage SHA, pointing wherever it likes, so a `check-run`/`branch-head` signal
+// is evaluated as: the newest run of exactly the declared `workflow` path for
+// this SHA (GET /actions/workflows/<file>/runs?head_sha=), from this
+// repository's own code (not a fork, not a pull_request event), and within it
+// the job named `name` — job objects are written only by GitHub. That job's
+// status/conclusion is the verdict. Newest run wins, so an older success cannot
+// be replayed past a newer failure, and a forged check run is simply never
+// consulted. A signal whose workflow has no run with that job for this SHA is
+// *not reported* (pending). `workflow-run` signals count only runs of exactly
+// `.github/workflows/<workflow>` from the target repository's own code on its
+// default branch (or the declared `branch`), so a stub of the observer on a
+// feature branch is not an observation.
 //
 //   node evaluate.mjs --repo OWNER/REPO --stage development \
 //     --config .github/stage-gate.json [--sha <sha>] [--publish] [--out file]
@@ -155,57 +151,22 @@ export function validateConfig(config) {
 // Signal evaluation
 // --------------------------------------------------------------------------
 
-// The newest check run by id is not always the informative one: a
-// `deployment_status`-triggered CI run attaches a *skipped* "Required Checks
-// Gate" to the same commit after the push run's real verdict. Prefer runs that
-// actually concluded something; fall back to the newest otherwise.
-export function latestCheckRun(runs) {
-  return informativeCheckRuns(runs)[0] ?? null;
-}
-
-/** Check runs newest first, informative (non skipped/neutral) ones before the rest. */
-export function informativeCheckRuns(runs) {
-  if (!runs?.length) return [];
-  const byNewest = [...runs].sort((a, b) => (b.id ?? 0) - (a.id ?? 0));
-  const informative = byNewest.filter((run) => run.status !== "completed" || !["skipped", "neutral"].includes(run.conclusion));
-  return informative.length ? informative : byNewest.slice(0, 1);
-}
-
 export const UNTRUSTED_OBSERVER_EVENTS = Object.freeze(["pull_request", "pull_request_target"]);
 
-/** `/actions/runs/<run>/job/<job>` from a check run's details_url; job-less URLs mean the check run was published via the API. */
-export function checkRunSource(checkRun) {
-  const match = /\/actions\/runs\/(\d+)(?:\/jobs?\/(\d+))?(?:[/?#]|$)/.exec(checkRun?.details_url ?? "");
-  if (!match) return null;
-  return { runId: match[1], jobId: match[2] ?? null };
+/** Why a workflow run may NOT be trusted as an observation of `sha` by `workflow`, or null when it may. */
+export function untrustedObserverRunReason(run, { repo, workflow, sha }) {
+  if (!run) return "no workflow run";
+  const id = run.id ?? "?";
+  if ((run.repository?.full_name ?? "").toLowerCase() !== repo.toLowerCase()) return `run ${id} belongs to ${run.repository?.full_name ?? "another repository"}, not ${repo}`;
+  const headRepo = run.head_repository?.full_name ?? run.repository?.full_name ?? "";
+  if (headRepo.toLowerCase() !== repo.toLowerCase()) return `run ${id} ran code from ${headRepo || "an unknown repository"} (fork), not ${repo}`;
+  if (UNTRUSTED_OBSERVER_EVENTS.includes(run.event)) return `run ${id} was triggered by ${run.event}; pull request runs cannot observe a stage head`;
+  if (run.path !== workflow) return `run ${id} is ${run.path ?? "an unknown workflow"}, not ${workflow}`;
+  if ((run.head_sha ?? "").toLowerCase() !== sha.toLowerCase()) return `run ${id} ran for ${(run.head_sha ?? "?").slice(0, 7)}, not this head`;
+  return null;
 }
 
-/**
- * Bind a check run to the job and workflow run that produced it. Pure: the
- * caller fetches `job` (GET /actions/jobs/<id>) and `workflowRun`
- * (GET /actions/runs/<id>). When bound, the job's status/conclusion is the
- * verdict; the check run's own fields are never used for the decision.
- * @returns {{ bound: boolean, reason?: string, status?: string, conclusion?: string|null }}
- */
-export function bindCheckRun({ checkRun, job, workflowRun, repo, sha, name, workflow }) {
-  const source = checkRunSource(checkRun);
-  if (!source) return { bound: false, reason: "check run names no workflow run (details_url); it was not produced by GitHub Actions" };
-  if (!source.jobId) return { bound: false, reason: `check run was published via the API by run ${source.runId}, not as a workflow job; its verdict cannot be verified` };
-  if (!job) return { bound: false, reason: `job ${source.jobId} named by the check run does not exist` };
-  if ((job.head_sha ?? "").toLowerCase() !== sha.toLowerCase()) return { bound: false, reason: `job ${source.jobId} ran for ${(job.head_sha ?? "?").slice(0, 7)}, not this head` };
-  if (job.name !== name) return { bound: false, reason: `job ${source.jobId} is "${job.name}", not "${name}"` };
-  if (String(job.run_id) !== String(source.runId)) return { bound: false, reason: `job ${source.jobId} belongs to run ${job.run_id}, not run ${source.runId} named by the check run` };
-  if (!workflowRun) return { bound: false, reason: `workflow run ${source.runId} does not exist` };
-  const owner = (workflowRun.repository?.full_name ?? "").toLowerCase();
-  const headRepo = (workflowRun.head_repository?.full_name ?? workflowRun.repository?.full_name ?? "").toLowerCase();
-  if (owner !== repo.toLowerCase()) return { bound: false, reason: `run ${source.runId} belongs to ${workflowRun.repository?.full_name ?? "another repository"}, not ${repo}` };
-  if (headRepo !== repo.toLowerCase()) return { bound: false, reason: `run ${source.runId} ran code from ${workflowRun.head_repository?.full_name ?? "an unknown repository"} (fork), not ${repo}` };
-  if (UNTRUSTED_OBSERVER_EVENTS.includes(workflowRun.event)) return { bound: false, reason: `run ${source.runId} was triggered by ${workflowRun.event}; pull request runs cannot observe a stage head` };
-  if ((workflowRun.head_sha ?? "").toLowerCase() !== sha.toLowerCase()) return { bound: false, reason: `run ${source.runId} ran for ${(workflowRun.head_sha ?? "?").slice(0, 7)}, not this head` };
-  if (workflow && workflowRun.path !== workflow) return { bound: false, reason: `run ${source.runId} is ${workflowRun.path ?? "an unknown workflow"}, not ${workflow}; a job named "${name}" elsewhere is not this observer` };
-  return { bound: true, status: job.status, conclusion: job.conclusion ?? null, runId: source.runId, jobId: source.jobId, path: workflowRun.path };
-}
-
+/** Classify a job's (or any status/conclusion pair's) verdict. */
 export function classifyCheckRun(run) {
   if (!run) return { state: "pending", detail: "no check run reported for this commit yet" };
   if (run.status !== "completed") return { state: "pending", detail: `check run is ${run.status}`, url: run.html_url };
@@ -218,34 +179,58 @@ export function classifyCheckRun(run) {
 }
 
 /**
- * The verdict of a named observer on a SHA: the newest informative check run
- * that binds to a genuine job of this repository's own workflow run for that
- * SHA. Unbound check runs are skipped; if none binds, the signal is pending
- * with the newest one's reason, so a forged check run can neither pass nor
- * fail a stage.
+ * The verdict of the job named `name` in the newest trusted run of `workflow`
+ * for `sha`. Pure over the fetched runs and a jobs lookup. A run whose job
+ * concluded `skipped`/`neutral` is not informative (a `deployment_status`-
+ * triggered CI run skips "Required Checks Gate" after the push run's real one),
+ * so the search continues to the next-newest run and falls back to the newest
+ * such run only when nothing informative exists.
+ * @param {object[]} runs
+ * @param {(runId: number|string) => Promise<object[]>} jobsOf
  */
-async function checkRunOnSha(api, repo, sha, name, workflow) {
-  const data = await api.getJson(repo, `/commits/${sha}/check-runs`, { check_name: name, per_page: 50 });
-  const candidates = informativeCheckRuns(data?.check_runs);
-  if (candidates.length === 0) return classifyCheckRun(null);
-  const runCache = new Map();
-  let firstReason = null;
-  for (const checkRun of candidates.slice(0, 5)) {
-    const source = checkRunSource(checkRun);
-    const job = source?.jobId ? await api.getJson(repo, `/actions/jobs/${source.jobId}`) : null;
-    let workflowRun = null;
-    if (source?.runId && job) {
-      if (!runCache.has(source.runId)) runCache.set(source.runId, await api.getJson(repo, `/actions/runs/${source.runId}`));
-      workflowRun = runCache.get(source.runId);
+export async function observerVerdict(runs, { repo, workflow, sha, name, maxRuns = 10 }, jobsOf) {
+  const ordered = [...(runs ?? [])].sort((a, b) => (b.id ?? 0) - (a.id ?? 0));
+  const rejected = [];
+  let fallback = null;
+  let considered = 0;
+  for (const run of ordered) {
+    if (considered >= maxRuns) break;
+    const reason = untrustedObserverRunReason(run, { repo, workflow, sha });
+    if (reason) {
+      rejected.push(reason);
+      continue;
     }
-    const binding = bindCheckRun({ checkRun, job, workflowRun, repo, sha, name, workflow });
-    if (binding.bound) {
-      const verdict = classifyCheckRun({ status: binding.status, conclusion: binding.conclusion, html_url: checkRun.html_url });
-      return { ...verdict, detail: `${verdict.detail} (job ${binding.jobId} of ${binding.path} run ${binding.runId})`, bound: true };
+    considered += 1;
+    const job = (await jobsOf(run.id)).find((candidate) => candidate.name === name);
+    if (!job) continue;
+    const verdict = { ...classifyCheckRun({ status: job.status, conclusion: job.conclusion, html_url: job.html_url ?? run.html_url }), runId: run.id, jobId: job.id, path: run.path, bound: true };
+    verdict.detail = `${verdict.detail} (job ${job.id} of ${run.path} run ${run.id})`;
+    if (job.status === "completed" && ["skipped", "neutral"].includes(job.conclusion)) {
+      fallback ??= verdict;
+      continue;
     }
-    firstReason ??= binding.reason;
+    return { ...verdict, considered, rejected };
   }
-  return { state: "pending", detail: `${candidates.length} check run(s) named "${name}" on this commit, none verifiable: ${firstReason}`, url: candidates[0].html_url, bound: false };
+  if (fallback) return { ...fallback, considered, rejected };
+  const why = considered === 0
+    ? `no run of ${workflow} for this commit${rejected.length ? ` (${rejected.length} run(s) not trusted: ${rejected[0]})` : ""}`
+    : `${considered} run(s) of ${workflow} for this commit, none with a job named "${name}"`;
+  return { state: "pending", detail: `${why}; the observer has not reported`, bound: false, considered, rejected };
+}
+
+/**
+ * Observer verdict for a named job of a pinned workflow on a SHA: runs of that
+ * workflow file filtered by head_sha, then the job by name — no check run is
+ * read at any point.
+ */
+async function observerOnSha(api, repo, sha, name, workflow) {
+  const file = workflow.split("/").pop();
+  const data = await api.getJson(repo, `/actions/workflows/${encodeURIComponent(file)}/runs`, { head_sha: sha, per_page: 50 });
+  return observerVerdict(
+    data?.workflow_runs ?? [],
+    { repo, workflow, sha, name },
+    async (runId) => (await api.getJson(repo, `/actions/runs/${runId}/jobs`, { per_page: 100 }))?.jobs ?? [],
+  );
 }
 
 export function classifyWorkflowRuns(runs, { now, maxAgeHours = 36, afterHead = false, headCommittedAt, absent = "pending", repo, path, branch }) {
@@ -350,7 +335,7 @@ export async function evaluateSignal(api, signal, context) {
   try {
     switch (signal.type) {
       case "check-run":
-        return await checkRunOnSha(api, repo, context.sha, signal.name, signal.workflow);
+        return await observerOnSha(api, repo, context.sha, signal.name, signal.workflow);
       case "workflow-run": {
         const branch = signal.branch ?? (await defaultBranchOf(api, repo, context));
         const data = await api.getJson(repo, `/actions/workflows/${encodeURIComponent(signal.workflow)}/runs`, {
@@ -373,7 +358,7 @@ export async function evaluateSignal(api, signal, context) {
       case "branch-head": {
         const branch = await api.getJson(repo, `/branches/${encodeURIComponent(signal.branch)}`);
         if (!branch?.commit?.sha) return { state: "fail", detail: `${repo}@${signal.branch} does not exist` };
-        const result = await checkRunOnSha(api, repo, branch.commit.sha, signal.check ?? "Required Checks Gate", signal.workflow);
+        const result = await observerOnSha(api, repo, branch.commit.sha, signal.check ?? "Required Checks Gate", signal.workflow);
         return { ...result, detail: `${repo}@${signal.branch} (${branch.commit.sha.slice(0, 7)}): ${result.detail}` };
       }
       case "drift-clear":

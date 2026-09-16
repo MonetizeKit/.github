@@ -4,10 +4,8 @@ import assert from "node:assert/strict";
 
 import {
   aggregate,
-  bindCheckRun,
   checkRunExternalId,
   checkRunPayload,
-  checkRunSource,
   classifyCheckRun,
   classifyWorkflowRuns,
   createGitHubApi,
@@ -15,7 +13,8 @@ import {
   evidenceArtifactName,
   extractShas,
   issueCitesRange,
-  latestCheckRun,
+  observerVerdict,
+  untrustedObserverRunReason,
   validateConfig,
 } from "./evaluate.mjs";
 
@@ -90,16 +89,6 @@ test("classifyCheckRun maps conclusions to pass, fail and pending", () => {
   assert.equal(classifyCheckRun({ status: "completed", conclusion: "skipped" }).state, "pending");
 });
 
-test("latestCheckRun prefers a run with a real verdict over a newer skipped one, and a newer in-progress run over an older verdict", () => {
-  const pushVerdict = { id: 10, status: "completed", conclusion: "success" };
-  const deploymentSkip = { id: 20, status: "completed", conclusion: "skipped" };
-  const rerun = { id: 30, status: "in_progress" };
-  assert.equal(latestCheckRun([deploymentSkip, pushVerdict]).id, 10);
-  assert.equal(latestCheckRun([deploymentSkip]).id, 20);
-  assert.equal(latestCheckRun([pushVerdict, rerun, deploymentSkip]).id, 30);
-  assert.equal(latestCheckRun([]), null);
-});
-
 test("createGitHubApi retries anonymously on 401 for other public repos only when no fleet token is configured", async () => {
   const calls = [];
   const fetchImpl = async (url, init) => {
@@ -168,151 +157,130 @@ test("aggregate: required fail wins, then required pending, advisory never moves
 });
 
 /**
- * A GitHub Actions job check run plus the job and workflow run that produced it,
- * the way the API reports them: details_url `/actions/runs/<run>/job/<job>`, a
- * job object with head_sha/name/run_id, a run with repository/head_repository/
- * event/head_sha. `jobRoutes` returns the API routes; `check` the check run.
+ * A workflow run of `path` for `sha` and its jobs, the way the API reports them
+ * (GET /actions/workflows/<file>/runs?head_sha= and GET /actions/runs/<id>/jobs).
+ * `jobs` is a list of { name, conclusion, status? }.
  */
-function actionsJob({ repo, sha, name, checkId, runId, jobId, conclusion = "success", status = "completed", event = "push", headRepo = repo, path = ".github/workflows/ci.yml", runOverrides = {}, jobOverrides = {} }) {
-  const check = { id: checkId, name, status, conclusion, html_url: `https://github.com/${repo}/actions/runs/${runId}/job/${jobId}`, details_url: `https://github.com/${repo}/actions/runs/${runId}/job/${jobId}`, app: { slug: "github-actions" } };
-  const routes = {
-    [`${repo}/actions/jobs/${jobId}`]: { id: jobId, run_id: runId, name, head_sha: sha, status, conclusion, ...jobOverrides },
-    [`${repo}/actions/runs/${runId}`]: { id: runId, event, head_sha: sha, head_branch: "development", path, repository: { full_name: repo }, head_repository: { full_name: headRepo }, ...runOverrides },
-  };
-  return { check, routes };
+function observerRun({ repo, sha, runId, path = ".github/workflows/ci.yml", event = "push", headRepo = repo, jobs, runOverrides = {} }) {
+  const run = { id: runId, event, head_sha: sha, head_branch: "development", path, html_url: `https://github.com/${repo}/actions/runs/${runId}`, repository: { full_name: repo }, head_repository: { full_name: headRepo }, ...runOverrides };
+  const jobList = jobs.map((job, index) => ({ id: runId * 10 + index, run_id: runId, status: "completed", html_url: `${run.html_url}/job/${runId * 10 + index}`, ...job }));
+  return { run, jobs: jobList, routes: { [`${repo}/actions/runs/${runId}/jobs`]: { total_count: jobList.length, jobs: jobList } } };
 }
 
-function developmentRoutes({ ciConclusion = "success", docsRuns = true, driftIssues = [], modelIssues = [], webConclusion = "success", extraChecks = {} } = {}) {
+/** Routes for GET /actions/workflows/<file>/runs?head_sha=<sha> answering with the given runs (asserting the head_sha filter is used). */
+function runsByShaRoute(repo, file, sha, runs) {
+  return { [`${repo}/actions/workflows/${file}/runs`]: (params) => { assert.equal(params.head_sha, sha, `${file} runs are filtered by head_sha`); return { total_count: runs.length, workflow_runs: runs }; } };
+}
+
+function developmentRoutes({ ciConclusion = "success", docsRuns = true, driftIssues = [], modelIssues = [], webConclusion = "success", extraCiRuns = [], extraDocsRuns = [], forgedChecks = [] } = {}) {
   const webHead = "d".repeat(40);
   const mono = "MonetizeKit/mono";
-  const ci = actionsJob({ repo: mono, sha: HEAD, name: "Required Checks Gate", checkId: 1, runId: 100, jobId: 1001, conclusion: ciConclusion });
-  const docsOld = actionsJob({ repo: mono, sha: HEAD, name: "Docs Post-Deploy / development", checkId: 5, runId: 105, jobId: 1005, conclusion: "failure", event: "deployment_status", path: ".github/workflows/docs-post-deploy.yml" });
-  const docsNew = actionsJob({ repo: mono, sha: HEAD, name: "Docs Post-Deploy / development", checkId: 9, runId: 109, jobId: 1009, conclusion: "success", event: "deployment_status", path: ".github/workflows/docs-post-deploy.yml" });
-  const web = actionsJob({ repo: "MonetizeKit/app-monetizekit-web", sha: webHead, name: "Required Checks Gate", checkId: 3, runId: 300, jobId: 3003, conclusion: webConclusion });
-  // Stage Review publishes its check run via the API (details_url is the run, no job): advisory, never bindable.
-  const review = { id: 2, name: "Stage Review / development", status: "completed", conclusion: "failure", details_url: `https://github.com/${mono}/actions/runs/200`, external_id: "stage-review:development" };
+  const ci = observerRun({ repo: mono, sha: HEAD, runId: 100, jobs: [{ name: "Lint" }, { name: "Required Checks Gate", conclusion: ciConclusion }] });
+  // A deployment_status-triggered CI run skips the gate job after the push run's real verdict: not informative.
+  const ciSkipped = observerRun({ repo: mono, sha: HEAD, runId: 101, event: "deployment_status", jobs: [{ name: "Required Checks Gate", conclusion: "skipped" }] });
+  const docsOld = observerRun({ repo: mono, sha: HEAD, runId: 105, event: "deployment_status", path: ".github/workflows/docs-post-deploy.yml", jobs: [{ name: "Docs Post-Deploy / development", conclusion: "failure" }] });
+  const docsNew = observerRun({ repo: mono, sha: HEAD, runId: 109, event: "deployment_status", path: ".github/workflows/docs-post-deploy.yml", jobs: [{ name: "Docs Post-Deploy / development", conclusion: "success" }] });
+  const web = observerRun({ repo: "MonetizeKit/app-monetizekit-web", sha: webHead, runId: 300, jobs: [{ name: "Required Checks Gate", conclusion: webConclusion }] });
+  // Stage Review publishes its check run via the API; its workflow has no job by that name, so it never binds (advisory anyway).
+  const review = observerRun({ repo: mono, sha: HEAD, runId: 200, event: "workflow_run", path: ".github/workflows/stage-review.yml", jobs: [{ name: "Publish verdict", conclusion: "success" }] });
+  const ciRuns = [ci.run, ciSkipped.run, ...extraCiRuns.map((extra) => extra.run)];
+  const docsRunsList = docsRuns ? [docsOld.run, docsNew.run, ...extraDocsRuns.map((extra) => extra.run)] : extraDocsRuns.map((extra) => extra.run);
   return {
-    ...ci.routes, ...docsOld.routes, ...docsNew.routes, ...web.routes,
+    ...ci.routes, ...ciSkipped.routes, ...docsOld.routes, ...docsNew.routes, ...web.routes, ...review.routes,
+    ...Object.assign({}, ...extraCiRuns.map((extra) => extra.routes), ...extraDocsRuns.map((extra) => extra.routes)),
+    ...runsByShaRoute(mono, "ci.yml", HEAD, ciRuns),
+    ...runsByShaRoute(mono, "docs-post-deploy.yml", HEAD, docsRunsList),
+    ...runsByShaRoute(mono, "stage-review.yml", HEAD, [review.run]),
+    ...runsByShaRoute("MonetizeKit/app-monetizekit-web", "ci.yml", webHead, [web.run]),
     "MonetizeKit/mono/branches/development": { commit: { sha: HEAD } },
     [`MonetizeKit/mono/commits/${HEAD}`]: { commit: { committer: { date: "2026-09-14T22:00:00Z" } } },
-    [`MonetizeKit/mono/commits/${HEAD}/check-runs`]: (params) => {
-      const extra = extraChecks[params.check_name] ?? [];
-      if (params.check_name === "Required Checks Gate") return { check_runs: [ci.check, ...extra] };
-      if (params.check_name === "Docs Post-Deploy / development") return docsRuns ? { check_runs: [docsOld.check, docsNew.check, ...extra] } : { check_runs: [...extra] };
-      if (params.check_name === "Stage Review / development") return { check_runs: [review] };
-      return { check_runs: [] };
-    },
+    // Check runs exist on the commit — some forged — and must never be read.
+    [`MonetizeKit/mono/commits/${HEAD}/check-runs`]: () => { throw new Error("the evaluator must not read check runs"); },
     "MonetizeKit/mono/compare/delivery...aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": { total_commits: 2, commits: [{ sha: HEAD }, { sha: OLD }] },
     "MonetizeKit/mono/issues": (params) => (params.labels === "examples-drift" ? driftIssues : params.labels === "model-usage-drift" ? modelIssues : []),
     "MonetizeKit/mono/issues/7/comments": [{ body: `follow-up escalation in ${OLD}` }],
     "MonetizeKit/app-monetizekit-web/branches/development": { commit: { sha: webHead } },
-    [`MonetizeKit/app-monetizekit-web/commits/${webHead}/check-runs`]: { check_runs: [web.check] },
+    [`MonetizeKit/app-monetizekit-web/commits/${webHead}/check-runs`]: () => { throw new Error("the evaluator must not read check runs"); },
   };
 }
 
-test("bindCheckRun: only a genuine job of this repository's own run for this SHA binds; the job's verdict is used", () => {
+test("untrustedObserverRunReason: only this repository's own non-PR run of the pinned workflow for this SHA", () => {
   const mono = "MonetizeKit/mono";
-  const good = actionsJob({ repo: mono, sha: HEAD, name: "Required Checks Gate", checkId: 1, runId: 100, jobId: 1001, conclusion: "failure" });
-  const job = good.routes[`${mono}/actions/jobs/1001`];
-  const workflowRun = good.routes[`${mono}/actions/runs/100`];
-  // The check run claims success; the job says failure. The job wins.
-  const bound = bindCheckRun({ checkRun: { ...good.check, conclusion: "success" }, job, workflowRun, repo: mono, sha: HEAD, name: "Required Checks Gate", workflow: ".github/workflows/ci.yml" });
-  assert.equal(bound.bound, true);
-  assert.equal(bound.conclusion, "failure");
-  assert.equal(bound.runId, "100");
-  assert.equal(bound.jobId, "1001");
-
-  assert.equal(bound.path, ".github/workflows/ci.yml");
-  const base = { checkRun: good.check, job, workflowRun, repo: mono, sha: HEAD, name: "Required Checks Gate", workflow: ".github/workflows/ci.yml" };
+  const ctx = { repo: mono, workflow: ".github/workflows/ci.yml", sha: HEAD };
+  const good = observerRun({ repo: mono, sha: HEAD, runId: 100, jobs: [] }).run;
+  assert.equal(untrustedObserverRunReason(good, ctx), null);
   const cases = [
-    ["no details_url", { checkRun: { ...good.check, details_url: undefined } }, /names no workflow run/],
-    ["API-published (run URL, no job)", { checkRun: { ...good.check, details_url: `https://github.com/${mono}/actions/runs/100` } }, /published via the API by run 100/],
-    ["job missing", { job: null }, /job 1001 named by the check run does not exist/],
-    ["job for another SHA", { job: { ...job, head_sha: OUTSIDE } }, /ran for ccccccc, not this head/],
-    ["job with another name", { job: { ...job, name: "Lint" } }, /is "Lint", not "Required Checks Gate"/],
-    ["job of another run", { job: { ...job, run_id: 777 } }, /belongs to run 777, not run 100/],
-    ["run missing", { workflowRun: null }, /workflow run 100 does not exist/],
-    ["run of another repository", { workflowRun: { ...workflowRun, repository: { full_name: "someone/fork" }, head_repository: { full_name: "someone/fork" } } }, /belongs to someone\/fork/],
-    ["run of fork code", { workflowRun: { ...workflowRun, head_repository: { full_name: "someone/fork" } } }, /ran code from someone\/fork/],
-    ["pull_request run", { workflowRun: { ...workflowRun, event: "pull_request" } }, /triggered by pull_request/],
-    ["pull_request_target run", { workflowRun: { ...workflowRun, event: "pull_request_target" } }, /triggered by pull_request_target/],
-    ["run for another SHA", { workflowRun: { ...workflowRun, head_sha: OUTSIDE } }, /run 100 ran for ccccccc/],
-    ["same-named job in a different workflow (collision)", { workflowRun: { ...workflowRun, path: ".github/workflows/forge.yml" } }, /is \.github\/workflows\/forge\.yml, not \.github\/workflows\/ci\.yml; a job named "Required Checks Gate" elsewhere is not this observer/],
+    ["missing", null, /no workflow run/],
+    ["another repository", { ...good, repository: { full_name: "someone/fork" }, head_repository: { full_name: "someone/fork" } }, /belongs to someone\/fork/],
+    ["fork code", { ...good, head_repository: { full_name: "someone/fork" } }, /ran code from someone\/fork/],
+    ["pull_request", { ...good, event: "pull_request" }, /triggered by pull_request/],
+    ["pull_request_target", { ...good, event: "pull_request_target" }, /triggered by pull_request_target/],
+    ["same-named job in another workflow (collision)", { ...good, path: ".github/workflows/forge.yml" }, /is \.github\/workflows\/forge\.yml, not \.github\/workflows\/ci\.yml/],
+    ["another SHA", { ...good, head_sha: OUTSIDE }, /ran for ccccccc, not this head/],
   ];
-  for (const [label, overrides, pattern] of cases) {
-    const verdict = bindCheckRun({ ...base, ...overrides });
-    assert.equal(verdict.bound, false, label);
-    assert.match(verdict.reason, pattern, label);
-  }
-  // deployment_status, workflow_run, schedule and push runs all observe a stage head legitimately.
+  for (const [label, run, pattern] of cases) assert.match(untrustedObserverRunReason(run, ctx) ?? "", pattern, label);
   for (const event of ["deployment_status", "workflow_run", "schedule", "push", "workflow_dispatch"]) {
-    assert.equal(bindCheckRun({ ...base, workflowRun: { ...workflowRun, event } }).bound, true, event);
+    assert.equal(untrustedObserverRunReason({ ...good, event }, ctx), null, event);
   }
-  assert.deepEqual(checkRunSource({ details_url: "https://github.com/o/r/actions/runs/12/job/34?pr=5" }), { runId: "12", jobId: "34" });
-  assert.deepEqual(checkRunSource({ details_url: "https://github.com/o/r/actions/runs/12" }), { runId: "12", jobId: null });
-  assert.equal(checkRunSource({ details_url: "https://example/forged" }), null);
 });
 
-test("evaluateStage: a forged check run on the stage head can neither pass nor fail a required signal", async () => {
+test("observerVerdict: the newest trusted run's job is the verdict; skipped jobs are not informative; untrusted runs and other jobs are ignored", async () => {
   const mono = "MonetizeKit/mono";
-  // Forged success for Docs Post-Deploy: newest by id, API-published, pointing at a real run. The genuine job (success) still binds.
-  const forgedSuccess = { id: 99, name: "Docs Post-Deploy / development", status: "completed", conclusion: "success", details_url: `https://github.com/${mono}/actions/runs/109` };
-  // Forged failure for Required Checks Gate, pointing at a job that exists but ran for another SHA on the attacker's branch.
-  const attackerJob = actionsJob({ repo: mono, sha: OUTSIDE, name: "Required Checks Gate", checkId: 98, runId: 900, jobId: 9009, conclusion: "failure", runOverrides: { head_branch: "feat/forge" } });
-  const forgedFailure = { ...attackerJob.check, id: 98 };
-  const routes = { ...developmentRoutes({ extraChecks: { "Docs Post-Deploy / development": [forgedSuccess], "Required Checks Gate": [forgedFailure] } }), ...attackerJob.routes };
-  const evaluation = await evaluateStage({ api: fakeApi(routes), config: baseConfig, stage: "development", selfRepo: mono, now: NOW });
-  const byId = Object.fromEntries(evaluation.signals.map((signal) => [signal.id, signal]));
-  assert.equal(byId.ci.state, "pass", "the genuine job's verdict is used; the forged failure is skipped");
-  assert.equal(byId.docs.state, "pass");
-  assert.equal(evaluation.conclusion, "success");
+  const ctx = { repo: mono, workflow: ".github/workflows/ci.yml", sha: HEAD, name: "Required Checks Gate" };
+  const green = observerRun({ repo: mono, sha: HEAD, runId: 100, jobs: [{ name: "Required Checks Gate", conclusion: "success" }] });
+  const red = observerRun({ repo: mono, sha: HEAD, runId: 102, jobs: [{ name: "Required Checks Gate", conclusion: "failure" }] });
+  const skipped = observerRun({ repo: mono, sha: HEAD, runId: 103, event: "deployment_status", jobs: [{ name: "Required Checks Gate", conclusion: "skipped" }] });
+  const collision = observerRun({ repo: mono, sha: HEAD, runId: 104, path: ".github/workflows/forge.yml", jobs: [{ name: "Required Checks Gate", conclusion: "success" }] });
+  const noJob = observerRun({ repo: mono, sha: HEAD, runId: 105, jobs: [{ name: "Lint", conclusion: "success" }] });
+  const jobsByRun = Object.fromEntries([green, red, skipped, collision, noJob].map((item) => [item.run.id, item.jobs]));
+  const lookups = [];
+  const jobsOf = async (runId) => { lookups.push(runId); return jobsByRun[runId]; };
 
-  // A second workflow landed on the stage SHA with a job named "Required Checks Gate" that passes, finishing after the
-  // real ci.yml job failed: the colliding job is a genuine Actions job for this SHA, but its run's path is not ci.yml.
-  const collidingJob = actionsJob({ repo: mono, sha: HEAD, name: "Required Checks Gate", checkId: 97, runId: 901, jobId: 9010, conclusion: "success", path: ".github/workflows/forge.yml" });
-  const collided = { ...developmentRoutes({ ciConclusion: "failure", extraChecks: { "Required Checks Gate": [collidingJob.check] } }), ...collidingJob.routes };
-  const red = await evaluateStage({ api: fakeApi(collided), config: baseConfig, stage: "development", selfRepo: mono, now: NOW });
-  const ci = red.signals.find((signal) => signal.id === "ci");
-  assert.equal(ci.state, "fail", "the real ci.yml verdict is used; the colliding workflow's job is skipped");
-  assert.match(ci.detail, /job 1001 of \.github\/workflows\/ci\.yml run 100/);
-  assert.equal(red.conclusion, "failure");
+  // Newest informative run (102, red) beats the older green (100); the skipped 103 and the colliding 104 do not count.
+  const verdict = await observerVerdict([green.run, red.run, skipped.run, collision.run, noJob.run], ctx, jobsOf);
+  assert.equal(verdict.state, "fail");
+  assert.equal(verdict.runId, 102);
+  assert.match(verdict.detail, /job 1020 of \.github\/workflows\/ci\.yml run 102/);
+  assert.deepEqual(lookups, [105, 103, 102], "newest first, colliding run never asked for jobs, stops at the first informative job");
+  assert.match(verdict.rejected[0], /forge\.yml/);
 
-  // With only forged check runs present (no genuine job for this SHA), the signal is pending — not pass, not fail.
-  const onlyForged = developmentRoutes({ docsRuns: false, extraChecks: { "Docs Post-Deploy / development": [forgedSuccess] } });
-  const pending = await evaluateStage({ api: fakeApi(onlyForged), config: baseConfig, stage: "development", selfRepo: mono, now: NOW });
+  // Only a skipped run: reported as pending via the fallback, not pass.
+  assert.equal((await observerVerdict([skipped.run], ctx, jobsOf)).state, "pending");
+  // No run has the job: pending, not reported.
+  const none = await observerVerdict([noJob.run], ctx, jobsOf);
+  assert.equal(none.state, "pending");
+  assert.match(none.detail, /none with a job named "Required Checks Gate"/);
+  // No trusted run at all.
+  const untrusted = await observerVerdict([collision.run], ctx, jobsOf);
+  assert.equal(untrusted.state, "pending");
+  assert.match(untrusted.detail, /no run of \.github\/workflows\/ci\.yml for this commit \(1 run\(s\) not trusted/);
+  assert.equal((await observerVerdict([], ctx, jobsOf)).state, "pending");
+});
+
+test("evaluateStage: forged or replayed check runs cannot move a required signal — check runs are never read", async () => {
+  const mono = "MonetizeKit/mono";
+  // Replay: ci.yml ran twice for this SHA; the older run passed, the newest failed. An attacker mints a check run
+  // pointing at the older job. The evaluator reads the newest run of ci.yml for the SHA and never the check run.
+  const rerunRed = observerRun({ repo: mono, sha: HEAD, runId: 110, jobs: [{ name: "Required Checks Gate", conclusion: "failure" }] });
+  const replay = await evaluateStage({ api: fakeApi(developmentRoutes({ ciConclusion: "success", extraCiRuns: [rerunRed] })), config: baseConfig, stage: "development", selfRepo: mono, now: NOW });
+  const ci = replay.signals.find((signal) => signal.id === "ci");
+  assert.equal(ci.state, "fail", "the newest ci.yml run for the SHA is the verdict");
+  assert.match(ci.detail, /run 110/);
+  assert.equal(replay.conclusion, "failure");
+
+  // Collision: a second workflow on the stage SHA with a passing job named "Required Checks Gate", finishing after the
+  // real ci.yml job failed. It is not a run of ci.yml, so it is not the observer.
+  const colliding = observerRun({ repo: mono, sha: HEAD, runId: 901, path: ".github/workflows/forge.yml", jobs: [{ name: "Required Checks Gate", conclusion: "success" }] });
+  const collided = await evaluateStage({ api: fakeApi(developmentRoutes({ ciConclusion: "failure", extraCiRuns: [colliding] })), config: baseConfig, stage: "development", selfRepo: mono, now: NOW });
+  assert.equal(collided.signals.find((signal) => signal.id === "ci").state, "fail");
+  assert.equal(collided.conclusion, "failure");
+
+  // No genuine observer run for the SHA at all: the signal is pending — not pass, not fail — whatever check runs exist.
+  const pending = await evaluateStage({ api: fakeApi(developmentRoutes({ docsRuns: false })), config: baseConfig, stage: "development", selfRepo: mono, now: NOW });
   const docs = pending.signals.find((signal) => signal.id === "docs");
   assert.equal(docs.state, "pending");
-  assert.match(docs.detail, /none verifiable: check run was published via the API by run 109/);
+  assert.match(docs.detail, /no run of \.github\/workflows\/docs-post-deploy\.yml for this commit/);
   assert.equal(pending.conclusion, "pending");
-});
-
-test("evaluateStage: development is green when every required signal passes; the shadow lens is reported but does not gate", async () => {
-  const api = fakeApi(developmentRoutes());
-  const evaluation = await evaluateStage({ api, config: baseConfig, stage: "development", selfRepo: "MonetizeKit/mono", now: NOW });
-  assert.equal(evaluation.sha, HEAD);
-  assert.equal(evaluation.conclusion, "success");
-  const byId = Object.fromEntries(evaluation.signals.map((signal) => [signal.id, signal]));
-  assert.equal(byId.docs.state, "pass", "the newest bound check run by id wins over an older failure");
-  assert.match(byId.docs.detail, /job 1009 of \.github\/workflows\/docs-post-deploy\.yml run 109/);
-  // Stage Review publishes via the API, so it cannot be bound: reported as pending/unverified, and advisory anyway.
-  assert.equal(byId.review.state, "pending");
-  assert.match(byId.review.detail, /published via the API/);
-  assert.equal(byId.review.required, false);
-  assert.match(evaluation.summary, /Stage Review \(shadow\) \| advisory \| pending/);
-  const payload = checkRunPayload(evaluation, { detailsUrl: "https://run", runId: "12345" });
-  assert.equal(payload.name, "Stage Gate / development");
-  assert.equal(payload.head_sha, HEAD);
-  assert.equal(payload.status, "completed");
-  assert.equal(payload.conclusion, "success");
-  assert.equal(payload.details_url, "https://run");
-  assert.equal(payload.external_id, "stage-gate:development:12345");
-  assert.equal(checkRunPayload(evaluation).external_id, "stage-gate:development");
-});
-
-test("evidence artifact name binds stage, exact SHA and conclusion — the part of the verdict the promotion bot verifies", () => {
-  assert.equal(evidenceArtifactName("development", HEAD, "success"), `stage-gate-development-${HEAD}-success`);
-  assert.equal(evidenceArtifactName("delivery", HEAD, "pending"), `stage-gate-delivery-${HEAD}-pending`);
-  assert.equal(checkRunExternalId("delivery", 7), "stage-gate:delivery:7");
 });
 
 test("evaluateStage: a missing Docs Post-Deploy check leaves the gate in progress, not red", async () => {
