@@ -334,7 +334,28 @@ export async function evaluateStage({ api, config, stage, selfRepo, sha, now = D
   return evaluation;
 }
 
-export function checkRunPayload(evaluation, { detailsUrl } = {}) {
+/**
+ * Name of the evidence artifact the Stage Gate workflow uploads for one
+ * evaluation. The conclusion is part of the name so the promotion bot can
+ * verify a verdict by listing the producing run's artifacts — an artifact can
+ * only be created by the run that owns it, unlike a check run, which any
+ * workflow with `checks: write` can mint under any name.
+ */
+export function evidenceArtifactName(stage, sha, conclusion) {
+  return `stage-gate-${stage}-${sha}-${conclusion}`;
+}
+
+/**
+ * `external_id` of the published check run: `stage-gate:<stage>:<run id>`.
+ * The run id is advisory (a forged check run can carry any external_id); the
+ * promotion bot uses it to find the producing workflow run and then verifies
+ * that run's identity and artifacts.
+ */
+export function checkRunExternalId(stage, runId) {
+  return runId ? `stage-gate:${stage}:${runId}` : `stage-gate:${stage}`;
+}
+
+export function checkRunPayload(evaluation, { detailsUrl, runId } = {}) {
   const blocking = evaluation.signals.filter((signal) => signal.required && signal.state !== "pass" && signal.state !== "skipped");
   const title = evaluation.conclusion === "success"
     ? `All ${evaluation.signals.filter((signal) => signal.required).length} required signals passed`
@@ -344,7 +365,7 @@ export function checkRunPayload(evaluation, { detailsUrl } = {}) {
   const payload = {
     name: `${CHECK_NAME_PREFIX}${evaluation.stage}`,
     head_sha: evaluation.sha,
-    external_id: `stage-gate:${evaluation.stage}`,
+    external_id: checkRunExternalId(evaluation.stage, runId),
     details_url: detailsUrl || undefined,
     output: { title, summary: evaluation.summary.slice(0, 65000) },
   };
@@ -398,11 +419,15 @@ async function main() {
     writeFileSync(args.out, `${JSON.stringify(evaluation, null, 2)}\n`);
   }
   if (args.publish) {
-    const run = await api.postJson(selfRepo, "/check-runs", checkRunPayload(evaluation, { detailsUrl: process.env.GITHUB_RUN_URL }));
+    const run = await api.postJson(selfRepo, "/check-runs", checkRunPayload(evaluation, { detailsUrl: process.env.GITHUB_RUN_URL, runId: process.env.GITHUB_RUN_ID }));
     console.log(`published ${run.name} (${run.status}${run.conclusion ? `/${run.conclusion}` : ""}) on ${evaluation.sha}: ${run.html_url}`);
   }
   if (process.env.GITHUB_OUTPUT) {
-    writeFileSync(process.env.GITHUB_OUTPUT, `conclusion=${evaluation.conclusion}\nsha=${evaluation.sha}\n`, { flag: "a" });
+    writeFileSync(
+      process.env.GITHUB_OUTPUT,
+      `conclusion=${evaluation.conclusion}\nsha=${evaluation.sha}\nartifact_name=${evidenceArtifactName(evaluation.stage, evaluation.sha, evaluation.conclusion)}\n`,
+      { flag: "a" },
+    );
   }
   if (process.env.GITHUB_STEP_SUMMARY) {
     writeFileSync(process.env.GITHUB_STEP_SUMMARY, `${evaluation.summary}\n`, { flag: "a" });

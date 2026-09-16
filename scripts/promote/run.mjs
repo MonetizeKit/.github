@@ -22,15 +22,31 @@
 // target `delivery` or `main` directly are failed by the `promotion-guard`
 // check (scripts/promote/guard.mjs).
 //
-//   node run.mjs --repo OWNER/REPO --source development --target delivery \
-//     --gate "Stage Gate / development" [--soak-minutes N] [--auto-merge] \
-//     [--changelog-file path] [--dry-run] [--out file]
+// Provenance. A green check run named `Stage Gate / <stage>` is not, by itself,
+// authorization: any workflow in the repository runs as the same GitHub Actions
+// app and can mint a check run under any name on any SHA. Before honoring a
+// green gate the bot resolves the workflow run the check run points at and
+// requires that it (a) is this repository's Stage Gate workflow, (b) ran on the
+// default branch from this repository (not a PR, not a fork), (c) completed
+// successfully, and (d) uploaded the evidence artifact
+// `stage-gate-<stage>-<head sha>-success`. Artifacts can only be created by the
+// run that owns them, so a forged check run cannot borrow another run's verdict
+// unless that run really evaluated this SHA to success — in which case the gate
+// is genuinely green. Anything else is `gate-untrusted` and nothing is opened.
 //
-// Environment: GITHUB_TOKEN (contents:read, pull-requests:write); GH_PAT — a
-// user or app token used to open the PR so that its CI runs (a PR opened with
-// the workflow's own GITHUB_TOKEN triggers no workflows, and a PR whose required
-// checks never report can never auto-merge). Falls back to GITHUB_TOKEN with a
-// warning. GITHUB_RUN_URL for the evidence footer.
+// Soak. `--soak-minutes` counts from when the source head LANDED on the source
+// branch (its commit date), not from the newest gate run: the gate republishes
+// every evaluation, so anchoring on it would reset the clock each cycle.
+//
+//   node run.mjs --repo OWNER/REPO --source development --target delivery \
+//     --gate "Stage Gate / development" [--gate-workflow .github/workflows/stage-gate.yml] \
+//     [--soak-minutes N] [--auto-merge] [--changelog-file path] [--dry-run] [--out file]
+//
+// Environment: GITHUB_TOKEN (contents:read, actions:read, pull-requests:write);
+// GH_PAT — a user or app token used to open the PR so that its CI runs (a PR
+// opened with the workflow's own GITHUB_TOKEN triggers no workflows, and a PR
+// whose required checks never report can never auto-merge). Falls back to
+// GITHUB_TOKEN with a warning. GITHUB_RUN_URL for the evidence footer.
 
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
@@ -42,6 +58,9 @@ export const HOPS = Object.freeze({
 });
 export const PROMOTION_LABEL = "promotion";
 export const PROMOTION_MARKER = "<!-- monetizekit-promotion -->";
+export const DEFAULT_GATE_WORKFLOW = ".github/workflows/stage-gate.yml";
+/** Events under which the caller's Stage Gate workflow legitimately runs on the default branch. */
+export const TRUSTED_GATE_EVENTS = Object.freeze(["schedule", "workflow_run", "workflow_dispatch", "push", "issues"]);
 const FAILED_CONCLUSIONS = new Set(["failure", "timed_out", "cancelled", "action_required", "startup_failure", "stale"]);
 const MAX_INCLUDED_PRS = 60;
 const MAX_BODY_CHARS = 60_000;
@@ -105,22 +124,70 @@ export function latestCheckRun(runs) {
 
 /**
  * Is the gate green for this head, and has the soak elapsed?
+ *
+ * The soak is anchored on `soakFrom` — when the head landed on the source
+ * branch — because the gate publishes a fresh check run on every evaluation
+ * (every 30 minutes on the schedule); anchoring on the run's `completed_at`
+ * would restart the clock each time and a soak longer than one cycle would
+ * never end. Falls back to `completed_at` only when no landing time is known.
  * @returns {{ state: "green"|"red"|"pending"|"soaking", detail: string, run?: object, readyAt?: string }}
  */
-export function gateState(run, { soakMinutes = 0, now = Date.now() } = {}) {
+export function gateState(run, { soakMinutes = 0, now = Date.now(), soakFrom } = {}) {
   if (!run) return { state: "pending", detail: "the gate has not reported for this head yet" };
   if (run.status !== "completed") return { state: "pending", detail: `the gate is ${run.status}`, run };
   if (run.conclusion !== "success") {
     return { state: FAILED_CONCLUSIONS.has(run.conclusion) ? "red" : "pending", detail: `the gate concluded ${run.conclusion}`, run };
   }
-  const completedAt = Date.parse(run.completed_at ?? "");
-  if (soakMinutes > 0 && Number.isFinite(completedAt)) {
-    const readyAt = completedAt + soakMinutes * 60_000;
+  const landedAt = Date.parse(soakFrom ?? "");
+  const anchor = Number.isFinite(landedAt) ? { at: landedAt, what: "the head landed" } : { at: Date.parse(run.completed_at ?? ""), what: "the gate went green" };
+  if (soakMinutes > 0 && Number.isFinite(anchor.at)) {
+    const readyAt = anchor.at + soakMinutes * 60_000;
     if (readyAt > now) {
-      return { state: "soaking", detail: `the gate went green at ${run.completed_at}; soaking until ${new Date(readyAt).toISOString()}`, run, readyAt: new Date(readyAt).toISOString() };
+      return {
+        state: "soaking",
+        detail: `${anchor.what} at ${new Date(anchor.at).toISOString()}; soaking until ${new Date(readyAt).toISOString()} (gate green since ${run.completed_at})`,
+        run,
+        readyAt: new Date(readyAt).toISOString(),
+      };
     }
   }
   return { state: "green", detail: `the gate is green (${run.completed_at})`, run };
+}
+
+/** Workflow run id a Stage Gate check run points at: `external_id` `stage-gate:<stage>:<id>`, else `details_url` `.../actions/runs/<id>`. */
+export function gateRunId(run) {
+  const fromExternal = /^stage-gate:[a-z]+:(\d+)$/.exec(run?.external_id ?? "");
+  if (fromExternal) return fromExternal[1];
+  const fromDetails = /\/actions\/runs\/(\d+)(?:[/?#]|$)/.exec(run?.details_url ?? "");
+  return fromDetails ? fromDetails[1] : null;
+}
+
+/**
+ * Does this green check run come from the repository's own Stage Gate workflow,
+ * run on the default branch from this repository, which uploaded the evidence
+ * artifact for exactly this stage, SHA and conclusion? Pure: the caller fetches
+ * the workflow run and its artifact list.
+ * @returns {{ trusted: boolean, reason: string, runId: string|null }}
+ */
+export function gateProvenance({ checkRun, workflowRun, artifacts, repo, defaultBranch, stage, headSha, gateWorkflow = DEFAULT_GATE_WORKFLOW }) {
+  const runId = gateRunId(checkRun);
+  const untrusted = (reason) => ({ trusted: false, reason, runId });
+  if (!runId) return untrusted("the check run names no producing workflow run (no external_id/details_url run id)");
+  if (!workflowRun) return untrusted(`workflow run ${runId} named by the check run does not exist in ${repo}`);
+  if ((workflowRun.repository?.full_name ?? "").toLowerCase() !== repo.toLowerCase()) return untrusted(`workflow run ${runId} belongs to ${workflowRun.repository?.full_name ?? "another repository"}, not ${repo}`);
+  if (workflowRun.path !== gateWorkflow) return untrusted(`workflow run ${runId} is ${workflowRun.path ?? "an unknown workflow"}, not ${gateWorkflow}`);
+  if (!TRUSTED_GATE_EVENTS.includes(workflowRun.event)) return untrusted(`workflow run ${runId} was triggered by ${workflowRun.event ?? "an unknown event"}; the gate is only minted by ${TRUSTED_GATE_EVENTS.join("/")}`);
+  if (workflowRun.head_branch !== defaultBranch) return untrusted(`workflow run ${runId} ran from ${workflowRun.head_branch ?? "an unknown branch"}, not the default branch ${defaultBranch}`);
+  const headRepo = workflowRun.head_repository?.full_name ?? workflowRun.repository?.full_name ?? "";
+  if (headRepo.toLowerCase() !== repo.toLowerCase()) return untrusted(`workflow run ${runId} ran code from ${headRepo || "an unknown repository"} (fork), not ${repo}`);
+  if (workflowRun.status !== "completed" || workflowRun.conclusion !== "success") return untrusted(`workflow run ${runId} is ${workflowRun.status}/${workflowRun.conclusion ?? "-"}, not completed/success`);
+  const expected = `stage-gate-${stage}-${headSha}-success`;
+  const names = (artifacts ?? []).map((artifact) => artifact.name);
+  if (!names.includes(expected)) {
+    const related = names.filter((name) => name.startsWith(`stage-gate-${stage}-`));
+    return untrusted(`workflow run ${runId} uploaded no artifact ${expected}${related.length ? ` (it has ${related.join(", ")})` : " (it evaluated nothing for this SHA)"}`);
+  }
+  return { trusted: true, reason: `verdict minted by ${gateWorkflow} run ${runId} on ${defaultBranch}, evidence ${expected}`, runId };
 }
 
 /** Pull request numbers referenced by merge and squash commits in the range. */
@@ -193,6 +260,9 @@ export function renderBody({ repo, source, target, headSha, baseSha, gate, commi
   lines.push(`## Gate evidence — ${gate.run?.name ?? "Stage Gate"}`);
   lines.push("");
   lines.push(`${gate.detail}${gate.run?.html_url ? ` ([check run](${gate.run.html_url}))` : ""}.`);
+  if (gate.provenance?.trusted) {
+    lines.push("", `Provenance verified: ${gate.provenance.reason}.`);
+  }
   const summary = gate.run?.output?.summary?.trim();
   if (summary) {
     lines.push("", "<details><summary>Loop-by-loop verdict quoted from the check run</summary>", "", summary, "", "</details>");
@@ -276,16 +346,19 @@ async function enableAutoMerge(api, pull) {
   }
 }
 
-export async function promote({ api, repo, source, target, gateName, soakMinutes = 0, autoMerge = false, changelog = "", dryRun = false, runUrl, now = Date.now() }) {
+export async function promote({ api, repo, source, target, gateName, gateWorkflow = DEFAULT_GATE_WORKFLOW, soakMinutes = 0, autoMerge = false, changelog = "", dryRun = false, runUrl, now = Date.now() }) {
   if (HOPS[source] !== target) throw new Error(`unsupported hop ${source} -> ${target}; chain is development -> delivery -> main`);
   const branch = await api.getJson(repo, `/branches/${encodeURIComponent(source)}`);
   if (!branch?.commit?.sha) throw new Error(`${repo} has no ${source} branch`);
   const headSha = branch.commit.sha;
+  // When the head landed on the source branch: for a promotion merge this is the
+  // merge commit's committer date, i.e. the start of its time on that stage.
+  const landedAt = branch.commit.commit?.committer?.date ?? branch.commit.commit?.author?.date ?? null;
   const targetBranch = await api.getJson(repo, `/branches/${encodeURIComponent(target)}`);
   if (!targetBranch?.commit?.sha) throw new Error(`${repo} has no ${target} branch`);
 
   const range = await listRangeCommits(api, repo, target, source);
-  const result = { repo, source, target, headSha, targetSha: targetBranch.commit.sha, aheadBy: range.aheadBy, behindBy: range.behindBy, gate: null, status: null, pr: null, autoMerge: null };
+  const result = { repo, source, target, headSha, landedAt, targetSha: targetBranch.commit.sha, aheadBy: range.aheadBy, behindBy: range.behindBy, gate: null, status: null, pr: null, autoMerge: null };
 
   if (range.aheadBy === 0) {
     result.status = "nothing-to-promote";
@@ -294,13 +367,31 @@ export async function promote({ api, repo, source, target, gateName, soakMinutes
   }
 
   const checks = await api.getJson(repo, `/commits/${headSha}/check-runs`, { check_name: gateName, per_page: 50 });
-  const gate = gateState(latestCheckRun(checks?.check_runs), { soakMinutes, now });
-  result.gate = { state: gate.state, detail: gate.detail, url: gate.run?.html_url ?? null, readyAt: gate.readyAt ?? null };
+  const gate = gateState(latestCheckRun(checks?.check_runs), { soakMinutes, now, soakFrom: landedAt });
+  result.gate = { state: gate.state, detail: gate.detail, url: gate.run?.html_url ?? null, readyAt: gate.readyAt ?? null, provenance: null };
   if (gate.state !== "green") {
     result.status = `gate-${gate.state}`;
     result.detail = `${gateName} on ${headSha.slice(0, 7)}: ${gate.detail}`;
     return result;
   }
+
+  // Green by name is not green by right: bind the verdict to the Stage Gate
+  // workflow run that minted it before acting on it.
+  const repository = await api.getJson(repo, "");
+  const defaultBranch = repository?.default_branch;
+  if (!defaultBranch) throw new Error(`${repo}: could not resolve the default branch`);
+  const runId = gateRunId(gate.run);
+  const workflowRun = runId ? await api.getJson(repo, `/actions/runs/${runId}`) : null;
+  const artifactPage = runId && workflowRun ? await api.getJson(repo, `/actions/runs/${runId}/artifacts`, { per_page: 100 }) : null;
+  const provenance = gateProvenance({ checkRun: gate.run, workflowRun, artifacts: artifactPage?.artifacts ?? [], repo, defaultBranch, stage: source, headSha, gateWorkflow });
+  result.gate.provenance = provenance;
+  if (!provenance.trusted) {
+    result.status = "gate-untrusted";
+    result.detail = `${gateName} on ${headSha.slice(0, 7)} is green but its provenance could not be verified: ${provenance.reason}. Nothing was opened. A check run under this name that did not come from ${gateWorkflow} on ${defaultBranch} is either a misconfiguration or an attempt to skip the chain — investigate before re-running.`;
+    result.warning = result.detail;
+    return result;
+  }
+  gate.provenance = provenance;
 
   const numbers = includedPullNumbers(range.commits).slice(0, MAX_INCLUDED_PRS);
   const pulls = [];
@@ -369,7 +460,7 @@ async function main() {
   const source = args.source;
   const target = args.target ?? HOPS[source];
   if (!repo || !source || !target || !args.gate) {
-    console.error("usage: run.mjs --repo OWNER/REPO --source development|delivery [--target delivery|main] --gate 'Stage Gate / <stage>' [--soak-minutes N] [--auto-merge] [--changelog-file path] [--dry-run] [--out file]");
+    console.error("usage: run.mjs --repo OWNER/REPO --source development|delivery [--target delivery|main] --gate 'Stage Gate / <stage>' [--gate-workflow path] [--soak-minutes N] [--auto-merge] [--changelog-file path] [--dry-run] [--out file]");
     process.exit(2);
   }
   const token = process.env.GITHUB_TOKEN;
@@ -389,6 +480,7 @@ async function main() {
     source,
     target,
     gateName: args.gate,
+    gateWorkflow: args["gate-workflow"] || DEFAULT_GATE_WORKFLOW,
     soakMinutes: Number(args["soak-minutes"] ?? 0),
     autoMerge: Boolean(args["auto-merge"]),
     changelog,
@@ -409,6 +501,7 @@ async function main() {
   if (process.env.GITHUB_STEP_SUMMARY) {
     const lines = [`## Promotion ${source} -> ${target}`, "", `**${result.status}** — ${result.detail ?? ""}`, ""];
     if (result.gate) lines.push(`Gate: ${result.gate.state} — ${result.gate.detail}${result.gate.url ? ` ([check run](${result.gate.url}))` : ""}`, "");
+    if (result.gate?.provenance) lines.push(`Provenance: ${result.gate.provenance.trusted ? "verified" : "NOT verified"} — ${result.gate.provenance.reason}`, "");
     if (result.pr) lines.push(`PR: ${result.pr.url}`, "");
     if (result.warning) lines.push(`> ${result.warning}`, "");
     if (body && result.status === "dry-run") lines.push("<details><summary>Body that would be posted</summary>", "", body, "", "</details>");

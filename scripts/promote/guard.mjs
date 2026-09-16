@@ -11,10 +11,16 @@
 // passes the check but the reason is spelled out in the check output, and
 // `sdlc-metrics` counts overrides.
 //
-//   node guard.mjs --base main --head delivery [--labels "a,b"]
+//   node guard.mjs --base main --head delivery --head-repo OWNER/REPO --base-repo OWNER/REPO [--labels "a,b"]
 //
 // In a workflow the event payload supplies base/head/labels via env
-// (GITHUB_BASE_REF, GITHUB_HEAD_REF, PR_LABELS).
+// (GITHUB_BASE_REF, GITHUB_HEAD_REF, PR_LABELS) and the repositories via
+// PR_HEAD_REPO and GITHUB_REPOSITORY.
+//
+// The head branch NAME alone proves nothing: a fork can call any branch
+// `development`. A guarded base therefore also requires the head to live in
+// this repository, so `development` means this repository's `development`
+// branch. The override label relaxes the hop, never the repository.
 
 import { writeFileSync } from "node:fs";
 import path from "node:path";
@@ -27,13 +33,22 @@ export const UPSTREAM = Object.freeze({
 export const OVERRIDE_LABEL = "promotion-override";
 
 /**
- * @param {{ baseRef: string, headRef: string, labels?: string[] }} pr
+ * @param {{ baseRef: string, headRef: string, labels?: string[], headRepo?: string, baseRepo?: string }} pr
  * @returns {{ pass: boolean, guarded: boolean, override: boolean, reason: string }}
  */
-export function guardDecision({ baseRef, headRef, labels = [] }) {
+export function guardDecision({ baseRef, headRef, labels = [], headRepo, baseRepo }) {
   const expected = UPSTREAM[baseRef];
   if (!expected) {
     return { pass: true, guarded: false, override: false, reason: `\`${baseRef}\` is not a guarded stage branch; feature PRs belong here` };
+  }
+  const sameRepo = Boolean(headRepo) && Boolean(baseRepo) && headRepo.toLowerCase() === baseRepo.toLowerCase();
+  if (!sameRepo) {
+    return {
+      pass: false,
+      guarded: true,
+      override: false,
+      reason: `\`${baseRef}\` only accepts pull requests whose head lives in this repository (head repository: \`${headRepo || "unknown"}\`, this repository: \`${baseRepo || "unknown"}\`); a fork branch named \`${headRef}\` is not the stage branch. Push the change to a branch in this repository and target \`development\``,
+    };
   }
   if (headRef === expected) {
     return { pass: true, guarded: true, override: false, reason: `promotion PR: \`${headRef}\` -> \`${baseRef}\` is the expected hop` };
@@ -62,12 +77,14 @@ function main() {
   const args = parseArgs(process.argv.slice(2));
   const baseRef = args.base ?? process.env.GITHUB_BASE_REF;
   const headRef = args.head ?? process.env.GITHUB_HEAD_REF;
+  const headRepo = args["head-repo"] ?? process.env.PR_HEAD_REPO;
+  const baseRepo = args["base-repo"] ?? process.env.GITHUB_REPOSITORY;
   const labels = String(args.labels ?? process.env.PR_LABELS ?? "").split(",").map((label) => label.trim()).filter(Boolean);
   if (!baseRef || !headRef) {
-    console.error("usage: guard.mjs --base <branch> --head <branch> [--labels a,b]");
+    console.error("usage: guard.mjs --base <branch> --head <branch> --head-repo OWNER/REPO --base-repo OWNER/REPO [--labels a,b]");
     process.exit(2);
   }
-  const decision = guardDecision({ baseRef, headRef, labels });
+  const decision = guardDecision({ baseRef, headRef, labels, headRepo, baseRepo });
   const line = `${decision.pass ? "✅" : "❌"} promotion-guard: ${decision.reason}`;
   console.log(line);
   if (decision.override) console.log(`::warning::${decision.reason}`);

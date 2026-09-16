@@ -12,9 +12,22 @@
 #                             code-owner approval on main is the release gate.
 #
 # The bot (scripts/promote/run.mjs, agent-policy role `promotion-bot`) reads
-# the stage gate check run and nothing else. It has no route to main: the
-# workflow token cannot bypass branch protection, and `reusable-promotion-guard`
-# fails any PR into delivery/main that is not the expected upstream stage.
+# the stage gate check run and nothing else — and does not take the check run
+# at its word. A green `Stage Gate / <stage>` is honored only after the bot
+# resolves the workflow run that minted it and confirms it is the caller's
+# `.github/workflows/stage-gate.yml` (`gate_workflow`), run on the default
+# branch from this repository, completed successfully, and that it uploaded the
+# evidence artifact `stage-gate-<stage>-<sha>-success` for exactly this head.
+# Any workflow with `checks: write` can mint a check run under any name; only
+# the producing run can create its own artifacts. A green check run that fails
+# this is `gate-untrusted`: nothing is opened and the run warns. Needs
+# `actions: read` on the caller's job. It has no route to main: the workflow
+# token cannot bypass branch protection, and `reusable-promotion-guard` fails
+# any PR into delivery/main that is not the expected upstream stage.
+#
+# `soak_minutes` counts from when the source head landed on its branch (the
+# merge commit's date), not from the newest gate run — the gate republishes on
+# every evaluation, which would otherwise restart the clock each cycle.
 #
 # The PR is opened with GH_PAT (a user/app token) because a PR opened with the
 # workflow's own GITHUB_TOKEN triggers no workflows — its required checks would
@@ -36,8 +49,12 @@ on:
         description: Check-run name that must be green on the source head (default "Stage Gate / <source>")
         type: string
         default: ""
+      gate_workflow:
+        description: Path (in the caller repo) of the workflow that legitimately mints the gate check run; a green check run from anything else is untrusted
+        type: string
+        default: ".github/workflows/stage-gate.yml"
       soak_minutes:
-        description: Extra minutes the gate must have been green before promoting (delivery -> main soak)
+        description: Minutes the source head must have been on its branch before promoting (delivery -> main soak), counted from the head's commit date
         type: number
         default: 0
       auto_merge:
@@ -62,7 +79,7 @@ on:
         required: false
     outputs:
       status:
-        description: nothing-to-promote | gate-pending | gate-red | gate-soaking | opened | updated | dry-run
+        description: nothing-to-promote | gate-pending | gate-red | gate-soaking | gate-untrusted | opened | updated | dry-run
         value: ${{ jobs.promote.outputs.status }}
       pr_url:
         description: URL of the promotion PR when one was opened or updated
@@ -74,6 +91,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      actions: read
       pull-requests: write
     outputs:
       status: ${{ steps.promote.outputs.status }}
@@ -147,12 +165,13 @@ jobs:
           SOURCE: ${{ inputs.source }}
           TARGET: ${{ steps.hop.outputs.target }}
           GATE: ${{ steps.hop.outputs.gate }}
+          GATE_WORKFLOW: ${{ inputs.gate_workflow }}
           SOAK: ${{ inputs.soak_minutes }}
           AUTO_MERGE: ${{ inputs.auto_merge }}
           DRY_RUN: ${{ inputs.dry_run }}
           HAS_CHANGELOG: ${{ inputs.changelog_command != '' }}
         run: |
-          args=(--repo "$GITHUB_REPOSITORY" --source "$SOURCE" --target "$TARGET" --gate "$GATE" --soak-minutes "$SOAK" --out ".artifacts/promote/${SOURCE}.json")
+          args=(--repo "$GITHUB_REPOSITORY" --source "$SOURCE" --target "$TARGET" --gate "$GATE" --gate-workflow "$GATE_WORKFLOW" --soak-minutes "$SOAK" --out ".artifacts/promote/${SOURCE}.json")
           if [ "$AUTO_MERGE" = "true" ]; then args+=(--auto-merge); fi
           if [ "$DRY_RUN" = "true" ]; then args+=(--dry-run); fi
           if [ "$HAS_CHANGELOG" = "true" ] && [ -s /tmp/promote/changelog.md ]; then args+=(--changelog-file /tmp/promote/changelog.md); fi

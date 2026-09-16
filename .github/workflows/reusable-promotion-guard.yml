@@ -2,10 +2,12 @@
 #
 # Emits the `promotion-guard` check on every pull request into `delivery` or
 # `main`: it passes only when the head is the stage directly upstream
-# (`development` -> `delivery`, `delivery` -> `main`). A feature branch aimed at
-# `main` fails, so the only route to production is the promotion chain and no
-# stage's observers are skipped. `promotion-override` passes an audited hotfix
-# with a warning; `sdlc-metrics` counts those.
+# (`development` -> `delivery`, `delivery` -> `main`) AND lives in this
+# repository — a fork branch merely named `development` is not the stage
+# branch and fails. A feature branch aimed at `main` fails, so the only route
+# to production is the promotion chain and no stage's observers are skipped.
+# `promotion-override` passes an audited same-repository hotfix with a warning;
+# `sdlc-metrics` counts those. Nothing lets a fork through.
 #
 # Call from a `pull_request` workflow with `branches: [delivery, main]` and add
 # `promotion-guard` to branch protection on both branches.
@@ -52,5 +54,7 @@ jobs:
         env:
           GITHUB_BASE_REF: ${{ github.base_ref }}
           GITHUB_HEAD_REF: ${{ github.head_ref }}
+          # Empty when the head repository was deleted; the guard fails closed.
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
         run: node /tmp/promote/guard.mjs

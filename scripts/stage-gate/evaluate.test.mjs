@@ -4,11 +4,13 @@ import assert from "node:assert/strict";
 
 import {
   aggregate,
+  checkRunExternalId,
   checkRunPayload,
   classifyCheckRun,
   classifyWorkflowRuns,
   createGitHubApi,
   evaluateStage,
+  evidenceArtifactName,
   extractShas,
   issueCitesRange,
   latestCheckRun,
@@ -173,12 +175,20 @@ test("evaluateStage: development is green when every required signal passes; the
   assert.equal(byId.review.state, "fail");
   assert.equal(byId.review.required, false);
   assert.match(evaluation.summary, /Stage Review \(shadow\) \| advisory \| fail/);
-  const payload = checkRunPayload(evaluation, { detailsUrl: "https://run" });
+  const payload = checkRunPayload(evaluation, { detailsUrl: "https://run", runId: "12345" });
   assert.equal(payload.name, "Stage Gate / development");
   assert.equal(payload.head_sha, HEAD);
   assert.equal(payload.status, "completed");
   assert.equal(payload.conclusion, "success");
   assert.equal(payload.details_url, "https://run");
+  assert.equal(payload.external_id, "stage-gate:development:12345");
+  assert.equal(checkRunPayload(evaluation).external_id, "stage-gate:development");
+});
+
+test("evidence artifact name binds stage, exact SHA and conclusion — the part of the verdict the promotion bot verifies", () => {
+  assert.equal(evidenceArtifactName("development", HEAD, "success"), `stage-gate-development-${HEAD}-success`);
+  assert.equal(evidenceArtifactName("delivery", HEAD, "pending"), `stage-gate-delivery-${HEAD}-pending`);
+  assert.equal(checkRunExternalId("delivery", 7), "stage-gate:delivery:7");
 });
 
 test("evaluateStage: a missing Docs Post-Deploy check leaves the gate in progress, not red", async () => {
