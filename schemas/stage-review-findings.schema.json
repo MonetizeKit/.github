@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://monetizekit.com/schemas/stage-review-findings.json",
+  "title": "MonetizeKit Stage Review model output (one pass, one role)",
+  "description": "Deterministic finding shape the stage-review model writes per pass. Extends review-findings.schema.json: the lens vocabulary is the 17-lens catalog and every finding can cite the deterministic partner evidence it relied on. Plain code (scripts/stage-review/verdict.mjs) decides the check-run conclusion from this file and the lens modes.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "commit_sha", "base_sha", "model", "role", "prompt_version", "lenses"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "commit_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "base_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "model": { "type": "string", "minLength": 3 },
+    "role": { "type": "string", "pattern": "^stage-review(:[a-z][a-z0-9-]*)?$" },
+    "prompt_version": { "type": "string", "minLength": 1 },
+    "policy_version": { "type": "string", "minLength": 1 },
+    "lenses": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["lens", "verdict", "findings"],
+        "properties": {
+          "lens": {
+            "enum": [
+              "brand-voice",
+              "examples",
+              "changelog",
+              "rest-apis",
+              "graphql-apis",
+              "mcp",
+              "sdk",
+              "e2e-testing",
+              "marketing-images",
+              "trust-docs",
+              "security-docs",
+              "internal-adrs",
+              "a11y",
+              "i18n",
+              "security-review",
+              "architecture-review",
+              "ai-prompt-review"
+            ]
+          },
+          "verdict": { "enum": ["pass", "findings", "insufficient-evidence"] },
+          "escalation_reason": {
+            "type": "string",
+            "minLength": 20,
+            "description": "Required rationale when verdict is insufficient-evidence"
+          },
+          "findings": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["file", "severity", "label", "problem", "remediation"],
+              "properties": {
+                "file": { "type": "string", "minLength": 1 },
+                "line": { "type": "integer", "minimum": 1 },
+                "severity": { "enum": ["critical", "high", "medium", "low"] },
+                "label": {
+                  "enum": ["important", "nit"],
+                  "description": "important = critical/high, nit = medium/low; only important can block"
+                },
+                "problem": { "type": "string", "minLength": 10 },
+                "remediation": { "type": "string", "minLength": 10 },
+                "evidence": {
+                  "type": "string",
+                  "minLength": 3,
+                  "description": "Partner report id or file:line the finding rests on"
+                }
+              }
+            }
+          }
+        },
+        "if": { "properties": { "verdict": { "const": "insufficient-evidence" } } },
+        "then": { "required": ["escalation_reason"] }
+      }
+    }
+  }
+}

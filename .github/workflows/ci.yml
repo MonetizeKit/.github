@@ -1,0 +1,59 @@
+# CI for the org-defaults repository itself: the reusable workflows lint clean
+# and the scripts consumers fetch from `v1` pass their unit tests before the tag
+# can move. Same `Required Checks Gate` context as the rest of the fleet.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scripts:
+    name: Org scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Unit tests (node:test)
+        run: node --test scripts/stage-gate/evaluate.test.mjs scripts/promote/promote.test.mjs
+      - name: Policy and schema files parse
+        run: |
+          for file in agent-policy.json schemas/*.json ops/*.json; do
+            node -e "JSON.parse(require('fs').readFileSync('$file','utf8'))" && echo "ok $file"
+          done
+
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run actionlint
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash) 1.7.7 /tmp
+          /tmp/actionlint -color
+
+  required-checks:
+    name: Required Checks Gate
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [scripts, actionlint]
+    steps:
+      - name: Validate required checks passed
+        shell: bash
+        env:
+          SCRIPTS: ${{ needs.scripts.result }}
+          ACTIONLINT: ${{ needs.actionlint.result }}
+        run: |
+          failures=0
+          for pair in "scripts=$SCRIPTS" "actionlint=$ACTIONLINT"; do
+            if [ "${pair#*=}" != "success" ]; then echo "Required check failed: $pair"; failures=$((failures+1)); else echo "Required check passed: $pair"; fi
+          done
+          [ "$failures" -eq 0 ] || exit 1
+          echo "All required checks passed."

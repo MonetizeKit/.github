@@ -1,0 +1,164 @@
+# Reusable Stage Gate.
+#
+# Aggregates every loop that can observe a stage branch (`development` or
+# `delivery`) into ONE check run on the stage head — `Stage Gate / <stage>` —
+# so promotion waits on all observers, not on the docs loop alone. Which loops
+# count is declared in the caller's `.github/stage-gate.json`
+# (schemas/stage-gate.schema.json); this workflow only evaluates and publishes.
+#
+# Semantics (scripts/stage-gate/evaluate.mjs):
+#   required signal failed        -> check run completed/failure
+#   required signal not reported  -> check run in_progress (pending)
+#   otherwise                     -> check run completed/success
+#   advisory signal (required:false) -> reported in the summary, never gates
+#
+# The caller re-runs this whenever an observer completes (`workflow_run`), on a
+# short schedule for observers in other repositories, on drift-issue closure,
+# and by hand. Each evaluation publishes a fresh check run; the newest one is
+# the verdict `reusable-promote.yml` reads — after verifying its provenance.
+#
+# Provenance. A check run is not proof: any workflow with `checks: write` can
+# mint one under this name on the stage head. So the verdict is only minted
+# from the caller's default branch (a `workflow_dispatch` from another branch
+# evaluates and reports but never publishes), the configuration is read from
+# the default branch rather than the calling ref (a PR branch cannot weaken
+# it), and the evidence artifact is named `stage-gate-<stage>-<sha>-<conclusion>`
+# — the promotion bot reads its verdict from the newest such artifact across
+# this workflow's default-branch runs, never from the check run. Observer
+# verdicts are likewise read from the newest run of each signal's pinned
+# workflow for the stage SHA and its job, never from check runs (evaluate.mjs).
+name: Reusable Stage Gate
+
+on:
+  workflow_call:
+    inputs:
+      stage:
+        description: Stage branch to gate (development | delivery)
+        type: string
+        required: true
+      config_path:
+        description: Path (in the caller repo) of the stage-gate configuration
+        type: string
+        default: ".github/stage-gate.json"
+      sha:
+        description: Evaluate this commit instead of the current stage head (dry runs)
+        type: string
+        default: ""
+      publish:
+        description: Publish the `Stage Gate / <stage>` check run (false = evaluate and report only). Honored only when the caller runs from its default branch.
+        type: boolean
+        default: true
+      policy_ref:
+        description: Ref of MonetizeKit/.github to read the evaluator from
+        type: string
+        default: "v1"
+    secrets:
+      GH_PAT:
+        description: Token able to read other fleet repositories (private members such as app-monetizekit-web); falls back to GITHUB_TOKEN
+        required: false
+    outputs:
+      conclusion:
+        description: success | failure | pending
+        value: ${{ jobs.evaluate.outputs.conclusion }}
+      sha:
+        description: The stage head that was evaluated
+        value: ${{ jobs.evaluate.outputs.sha }}
+
+jobs:
+  evaluate:
+    name: Stage Gate / ${{ inputs.stage }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+      actions: read
+      issues: read
+    outputs:
+      conclusion: ${{ steps.gate.outputs.conclusion }}
+      sha: ${{ steps.gate.outputs.sha }}
+    steps:
+      - name: Validate stage input
+        env:
+          STAGE: ${{ inputs.stage }}
+        run: |
+          case "$STAGE" in
+            development|delivery) echo "stage=$STAGE" ;;
+            *) echo "::error::stage must be development or delivery, got '$STAGE'"; exit 1 ;;
+          esac
+
+      # `github.event.repository` is absent on `schedule` events, so the default
+      # branch is resolved through the API rather than the event payload.
+      - name: Resolve the default branch and whether this run may publish
+        id: trust
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH_INPUT: ${{ inputs.publish }}
+          RUN_REF: ${{ github.ref }}
+          RUN_EVENT: ${{ github.event_name }}
+        run: |
+          default_branch="$(gh api "repos/${GITHUB_REPOSITORY}" --jq .default_branch)"
+          if [ -z "$default_branch" ]; then echo "::error::could not resolve the default branch"; exit 1; fi
+          publish=false
+          if [ "$PUBLISH_INPUT" = "true" ]; then
+            if [ "$RUN_REF" = "refs/heads/${default_branch}" ]; then
+              publish=true
+            else
+              echo "::warning::publish requested from ${RUN_REF} (${RUN_EVENT}); the Stage Gate verdict is only minted from refs/heads/${default_branch}. Evaluating and reporting without publishing."
+            fi
+          fi
+          {
+            echo "default_branch=${default_branch}"
+            echo "publish=${publish}"
+          } >> "$GITHUB_OUTPUT"
+          echo "default branch ${default_branch}; publish=${publish}"
+
+      # The configuration comes from the default branch, not from the calling
+      # ref: what can hold a promotion is what the trusted branch declares.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.trust.outputs.default_branch }}
+          sparse-checkout: |
+            ${{ inputs.config_path }}
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Fetch the stage-gate evaluator
+        env:
+          POLICY_REF: ${{ inputs.policy_ref }}
+        run: |
+          base="https://raw.githubusercontent.com/MonetizeKit/.github/${POLICY_REF}"
+          mkdir -p /tmp/stage-gate
+          curl -fsSL "${base}/scripts/stage-gate/evaluate.mjs" -o /tmp/stage-gate/evaluate.mjs
+          curl -fsSL "${base}/schemas/stage-gate.schema.json" -o /tmp/stage-gate/stage-gate.schema.json
+          echo "fetched evaluate.mjs from ${POLICY_REF}"
+
+      - name: Evaluate and publish
+        id: gate
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          STAGE: ${{ inputs.stage }}
+          CONFIG_PATH: ${{ inputs.config_path }}
+          SHA: ${{ inputs.sha }}
+          PUBLISH: ${{ steps.trust.outputs.publish }}
+        run: |
+          args=(--repo "$GITHUB_REPOSITORY" --stage "$STAGE" --config "$CONFIG_PATH" --out ".artifacts/stage-gate/${STAGE}.json")
+          if [ -n "$SHA" ]; then args+=(--sha "$SHA"); fi
+          if [ "$PUBLISH" = "true" ]; then args+=(--publish); fi
+          node /tmp/stage-gate/evaluate.mjs "${args[@]}"
+
+      # The artifact name is the verifiable part of the verdict (see header):
+      # `stage-gate-<stage>-<sha>-<conclusion>`, produced by scripts/stage-gate/
+      # evaluate.mjs so the promotion bot and this workflow agree on it.
+      - name: Upload gate evidence
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ steps.gate.outputs.artifact_name || format('stage-gate-{0}-run-{1}', inputs.stage, github.run_id) }}
+          path: .artifacts/stage-gate/
+          if-no-files-found: warn
+          retention-days: 30
