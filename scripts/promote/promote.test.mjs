@@ -7,15 +7,16 @@ import {
   DEFAULT_GATE_WORKFLOW,
   HOPS,
   PROMOTION_MARKER,
-  gateProvenance,
-  gateRunId,
+  displayCheckRun,
+  findTrustedVerdict,
+  gateEvidence,
   gateState,
   includedPullNumbers,
-  latestCheckRun,
   promote,
   promotionTitle,
   renderBody,
   reviewFindingsFromComments,
+  untrustedGateRunReason,
 } from "./run.mjs";
 
 const NOW = Date.parse("2026-09-15T06:00:00Z");
@@ -59,10 +60,11 @@ const greenGate = {
   output: { summary: "| ✅ | Required Checks Gate |" },
 };
 
-/** The workflow run that legitimately minted `greenGate`: Stage Gate on the default branch, from this repo, green. */
+/** A Stage Gate workflow run as listed by /actions/workflows/stage-gate.yml/runs: default branch, this repo, green. */
 function gateWorkflowRun(overrides = {}) {
   return {
     id: Number(GATE_RUN_ID), path: DEFAULT_GATE_WORKFLOW, event: "schedule", head_branch: "main", status: "completed", conclusion: "success",
+    created_at: "2026-09-15T04:30:00Z", updated_at: "2026-09-15T05:00:00Z", html_url: `https://github.com/${REPO}/actions/runs/${GATE_RUN_ID}`,
     repository: { full_name: REPO }, head_repository: { full_name: REPO },
     ...overrides,
   };
@@ -72,13 +74,16 @@ function gateArtifacts(stage = "development", sha = HEAD, conclusion = "success"
   return { total_count: 1, artifacts: [{ name: `stage-gate-${stage}-${sha}-${conclusion}` }] };
 }
 
-function baseRoutes({ gate = greenGate, aheadBy = 2, workflowRun = gateWorkflowRun(), artifacts = gateArtifacts(), landedAt = LANDED_AT } = {}) {
-  return {
+/** The trusted verdict as findTrustedVerdict returns it for the default fixture. */
+const trustedVerdict = { conclusion: "success", runId: Number(GATE_RUN_ID), runUrl: `https://github.com/${REPO}/actions/runs/${GATE_RUN_ID}`, artifact: `stage-gate-development-${HEAD}-success`, completedAt: "2026-09-15T05:00:00Z" };
+
+function baseRoutes({ gate = greenGate, aheadBy = 2, workflowRuns = [gateWorkflowRun()], artifacts = gateArtifacts(), landedAt = LANDED_AT, extraArtifacts = {} } = {}) {
+  const routes = {
     [REPO]: { default_branch: "main" },
     [`${REPO}/branches/development`]: { commit: { sha: HEAD, commit: { committer: { date: landedAt } } } },
     [`${REPO}/branches/delivery`]: { commit: { sha: TARGET } },
     [`${REPO}/branches/main`]: { commit: { sha: TARGET } },
-    [`${REPO}/actions/runs/${GATE_RUN_ID}`]: workflowRun,
+    [`${REPO}/actions/workflows/stage-gate.yml/runs`]: { total_count: workflowRuns.length, workflow_runs: workflowRuns },
     [`${REPO}/actions/runs/${GATE_RUN_ID}/artifacts`]: artifacts,
     [`${REPO}/compare/delivery...development`]: {
       status: aheadBy === 0 ? "identical" : "ahead",
@@ -102,6 +107,10 @@ function baseRoutes({ gate = greenGate, aheadBy = 2, workflowRun = gateWorkflowR
     [`${REPO}/labels/promotion`]: { name: "promotion" },
     [`${REPO}/labels/stage:delivery`]: null,
   };
+  for (const [runId, names] of Object.entries(extraArtifacts)) {
+    routes[`${REPO}/actions/runs/${runId}/artifacts`] = { total_count: names.length, artifacts: names.map((name) => ({ name })) };
+  }
+  return routes;
 }
 
 test("the chain is development -> delivery -> main and the guard mirrors it", () => {
@@ -109,74 +118,112 @@ test("the chain is development -> delivery -> main and the guard mirrors it", ()
   assert.deepEqual(UPSTREAM, { delivery: "development", main: "delivery" });
 });
 
-test("gateState: green only on completed/success after the soak", () => {
+test("gateState: green only on a trusted success verdict, after the soak", () => {
   assert.equal(gateState(null).state, "pending");
-  assert.equal(gateState({ status: "in_progress" }).state, "pending");
-  assert.equal(gateState({ status: "completed", conclusion: "failure" }).state, "red");
-  assert.equal(gateState({ status: "completed", conclusion: "skipped" }).state, "pending");
-  assert.equal(gateState(greenGate, { now: NOW }).state, "green");
-  // Without a landing time the soak falls back to the run's completed_at.
-  const soaking = gateState(greenGate, { soakMinutes: 120, now: NOW });
+  assert.match(gateState(null).detail, /no trusted Stage Gate evaluation/);
+  assert.equal(gateState({ conclusion: "pending", runId: 1 }).state, "pending");
+  assert.equal(gateState({ conclusion: "failure", runId: 1 }).state, "red");
+  assert.equal(gateState(trustedVerdict, { now: NOW }).state, "green");
+  assert.match(gateState(trustedVerdict, { now: NOW }).detail, /evidence stage-gate-development-a+-success/);
+  // Without a landing time the soak falls back to the evaluation time.
+  const soaking = gateState(trustedVerdict, { soakMinutes: 120, now: NOW });
   assert.equal(soaking.state, "soaking");
   assert.equal(soaking.readyAt, "2026-09-15T07:00:00.000Z");
-  assert.equal(gateState(greenGate, { soakMinutes: 30, now: NOW }).state, "green");
+  assert.equal(gateState(trustedVerdict, { soakMinutes: 30, now: NOW }).state, "green");
 });
 
-test("gateState: the soak counts from when the head landed, so a gate that republishes every cycle cannot reset it", () => {
-  // Head landed 22:00 the day before; the newest green run completed at 05:00 (one hour ago).
-  // A 6-hour soak anchored on the head is over; anchored on the run it would never end.
-  const green = gateState(greenGate, { soakMinutes: 360, now: NOW, soakFrom: LANDED_AT });
-  assert.equal(green.state, "green");
-  const soaking = gateState(greenGate, { soakMinutes: 600, now: NOW, soakFrom: LANDED_AT });
+test("gateState: the soak counts from when the head landed, so re-evaluating every cycle cannot reset it", () => {
+  // Head landed 22:00 the day before; the newest evaluation completed at 05:00 (one hour ago).
+  // A 6-hour soak anchored on the head is over; anchored on the evaluation it would never end.
+  assert.equal(gateState(trustedVerdict, { soakMinutes: 360, now: NOW, soakFrom: LANDED_AT }).state, "green");
+  const soaking = gateState(trustedVerdict, { soakMinutes: 600, now: NOW, soakFrom: LANDED_AT });
   assert.equal(soaking.state, "soaking");
   assert.equal(soaking.readyAt, "2026-09-15T08:00:00.000Z");
   assert.match(soaking.detail, /the head landed at 2026-09-14T22:00:00.000Z/);
-  // A newer republished run with the same head does not move readyAt.
-  const republished = { ...greenGate, id: 3, completed_at: "2026-09-15T05:30:00Z" };
-  assert.equal(gateState(republished, { soakMinutes: 600, now: NOW, soakFrom: LANDED_AT }).readyAt, "2026-09-15T08:00:00.000Z");
+  const reevaluated = { ...trustedVerdict, runId: 9003, completedAt: "2026-09-15T05:30:00Z" };
+  assert.equal(gateState(reevaluated, { soakMinutes: 600, now: NOW, soakFrom: LANDED_AT }).readyAt, "2026-09-15T08:00:00.000Z");
 });
 
-test("gateRunId reads the producing run from external_id first, then details_url", () => {
-  assert.equal(gateRunId(greenGate), GATE_RUN_ID);
-  assert.equal(gateRunId({ details_url: `https://github.com/${REPO}/actions/runs/42?check_suite_focus=true` }), "42");
-  assert.equal(gateRunId({ external_id: "stage-gate:development", details_url: "https://example/gate" }), null);
-  assert.equal(gateRunId({ external_id: "stage-gate:development:12", details_url: `https://github.com/${REPO}/actions/runs/13` }), "12");
-  assert.equal(gateRunId(null), null);
+test("gateEvidence reads the conclusion from the artifact name and ignores other stages, SHAs and junk", () => {
+  assert.deepEqual(gateEvidence([`stage-gate-development-${HEAD}-success`], { stage: "development", headSha: HEAD }), { conclusion: "success", artifact: `stage-gate-development-${HEAD}-success` });
+  assert.equal(gateEvidence([`stage-gate-development-${HEAD}-failure`], { stage: "development", headSha: HEAD }).conclusion, "failure");
+  assert.equal(gateEvidence([`stage-gate-development-${HEAD}-pending`], { stage: "development", headSha: HEAD }).conclusion, "pending");
+  assert.equal(gateEvidence([`stage-gate-delivery-${HEAD}-success`], { stage: "development", headSha: HEAD }), null);
+  assert.equal(gateEvidence([`stage-gate-development-${"c".repeat(40)}-success`], { stage: "development", headSha: HEAD }), null);
+  assert.equal(gateEvidence([`stage-gate-development-${HEAD}-bogus`, "stage-gate-development-run-5"], { stage: "development", headSha: HEAD }), null);
+  assert.equal(gateEvidence([], { stage: "development", headSha: HEAD }), null);
+  assert.equal(gateEvidence(null, { stage: "development", headSha: HEAD }), null);
 });
 
-test("gateProvenance: trusts only the default-branch Stage Gate run from this repository that uploaded success evidence for this SHA", () => {
-  const base = { checkRun: greenGate, repo: REPO, defaultBranch: "main", stage: "development", headSha: HEAD };
-  const ok = gateProvenance({ ...base, workflowRun: gateWorkflowRun(), artifacts: gateArtifacts().artifacts });
-  assert.equal(ok.trusted, true);
-  assert.match(ok.reason, new RegExp(`run ${GATE_RUN_ID} on main`));
-
+test("untrustedGateRunReason: only this repository's Stage Gate workflow on the default branch, from this repository, green", () => {
+  const ctx = { repo: REPO, defaultBranch: "main" };
+  assert.equal(untrustedGateRunReason(gateWorkflowRun(), ctx), null);
   const cases = [
-    ["no producing run named", { checkRun: { ...greenGate, external_id: "stage-gate:development", details_url: "https://example/gate" }, workflowRun: gateWorkflowRun(), artifacts: gateArtifacts().artifacts }, /names no producing workflow run/],
-    ["run does not exist", { workflowRun: null, artifacts: [] }, /does not exist/],
-    ["run from another repository", { workflowRun: gateWorkflowRun({ repository: { full_name: "someone/fork" }, head_repository: { full_name: "someone/fork" } }), artifacts: gateArtifacts().artifacts }, /belongs to someone\/fork/],
-    ["run of a different workflow", { workflowRun: gateWorkflowRun({ path: ".github/workflows/forge.yml" }), artifacts: gateArtifacts().artifacts }, /is \.github\/workflows\/forge\.yml/],
-    ["run triggered by a pull request", { workflowRun: gateWorkflowRun({ event: "pull_request" }), artifacts: gateArtifacts().artifacts }, /triggered by pull_request/],
-    ["run from a non-default branch (weakened config)", { workflowRun: gateWorkflowRun({ event: "workflow_dispatch", head_branch: "feat/weaken-gate" }), artifacts: gateArtifacts().artifacts }, /ran from feat\/weaken-gate/],
-    ["run whose code came from a fork", { workflowRun: gateWorkflowRun({ head_repository: { full_name: "someone/fork" } }), artifacts: gateArtifacts().artifacts }, /ran code from someone\/fork/],
-    ["run that did not succeed", { workflowRun: gateWorkflowRun({ conclusion: "failure" }), artifacts: gateArtifacts().artifacts }, /completed\/failure/],
-    ["run still in progress", { workflowRun: gateWorkflowRun({ status: "in_progress", conclusion: null }), artifacts: gateArtifacts().artifacts }, /in_progress/],
-    ["legitimate run, but it evaluated another SHA", { workflowRun: gateWorkflowRun(), artifacts: gateArtifacts("development", "c".repeat(40)).artifacts }, /uploaded no artifact stage-gate-development-a+-success \(it has stage-gate-development-c+-success\)/],
-    ["legitimate run, but its verdict for this SHA was pending", { workflowRun: gateWorkflowRun(), artifacts: gateArtifacts("development", HEAD, "pending").artifacts }, /-pending\)/],
-    ["legitimate run, but for the other stage", { workflowRun: gateWorkflowRun(), artifacts: gateArtifacts("delivery").artifacts }, /evaluated nothing for this SHA/],
-    ["legitimate run with no artifacts at all", { workflowRun: gateWorkflowRun(), artifacts: [] }, /evaluated nothing for this SHA/],
+    ["missing", null, /no workflow run/],
+    ["another repository", gateWorkflowRun({ repository: { full_name: "someone/fork" }, head_repository: { full_name: "someone/fork" } }), /belongs to someone\/fork/],
+    ["another workflow", gateWorkflowRun({ path: ".github/workflows/forge.yml" }), /is \.github\/workflows\/forge\.yml/],
+    ["pull_request event", gateWorkflowRun({ event: "pull_request" }), /triggered by pull_request/],
+    ["non-default branch (weakened config)", gateWorkflowRun({ event: "workflow_dispatch", head_branch: "feat/weaken-gate" }), /ran from feat\/weaken-gate/],
+    ["fork code", gateWorkflowRun({ head_repository: { full_name: "someone/fork" } }), /ran code from someone\/fork/],
+    ["failed", gateWorkflowRun({ conclusion: "failure" }), /completed\/failure/],
+    ["cancelled (superseded)", gateWorkflowRun({ conclusion: "cancelled" }), /completed\/cancelled/],
+    ["in progress", gateWorkflowRun({ status: "in_progress", conclusion: null }), /in_progress/],
   ];
-  for (const [label, overrides, pattern] of cases) {
-    const verdict = gateProvenance({ ...base, ...overrides });
-    assert.equal(verdict.trusted, false, label);
-    assert.match(verdict.reason, pattern, label);
-  }
+  for (const [label, run, pattern] of cases) assert.match(untrustedGateRunReason(run, ctx) ?? "", pattern, label);
   // A caller may relocate its Stage Gate workflow; the expected path follows.
-  assert.equal(gateProvenance({ ...base, gateWorkflow: ".github/workflows/gate.yml", workflowRun: gateWorkflowRun({ path: ".github/workflows/gate.yml" }), artifacts: gateArtifacts().artifacts }).trusted, true);
+  assert.equal(untrustedGateRunReason(gateWorkflowRun({ path: ".github/workflows/gate.yml" }), { ...ctx, gateWorkflow: ".github/workflows/gate.yml" }), null);
 });
 
-test("latestCheckRun prefers the newest informative run over a newer skipped one", () => {
-  const runs = [{ id: 1, status: "completed", conclusion: "success" }, { id: 3, status: "completed", conclusion: "skipped" }, { id: 2, status: "completed", conclusion: "failure" }];
-  assert.equal(latestCheckRun(runs).id, 2);
+test("findTrustedVerdict: the newest trusted run with evidence for this SHA wins; untrusted runs are skipped, older runs cannot replay a stale success", async () => {
+  const ctx = { repo: REPO, defaultBranch: "main", gateWorkflow: DEFAULT_GATE_WORKFLOW, stage: "development", headSha: HEAD, landedAt: LANDED_AT };
+  const artifactsByRun = {
+    9003: [`stage-gate-development-${HEAD}-failure`, `stage-gate-delivery-${TARGET}-success`],
+    9002: [],
+    9001: [`stage-gate-development-${HEAD}-success`],
+    8000: [`stage-gate-development-${HEAD}-success`],
+  };
+  const lookups = [];
+  const artifactNamesOf = async (runId) => { lookups.push(runId); return artifactsByRun[runId] ?? []; };
+  const runs = [
+    gateWorkflowRun({ id: 9001, created_at: "2026-09-15T04:30:00Z" }),
+    gateWorkflowRun({ id: 9003, created_at: "2026-09-15T05:30:00Z" }),
+    gateWorkflowRun({ id: 9002, created_at: "2026-09-15T05:00:00Z", event: "workflow_dispatch", head_branch: "feat/weaken-gate" }),
+    gateWorkflowRun({ id: 8000, created_at: "2026-09-14T21:00:00Z" }), // before the head landed
+  ];
+  // Newest evaluation (9003) went red: the older 9001 success is not consulted at all.
+  const red = await findTrustedVerdict(runs, ctx, artifactNamesOf);
+  assert.equal(red.verdict.conclusion, "failure");
+  assert.equal(red.verdict.runId, 9003);
+  assert.deepEqual(lookups, [9003], "stops at the newest trusted run that carries evidence for this SHA");
+  assert.equal(red.rejected.length, 0);
+
+  // Without 9003 the weakened-config run 9002 is skipped (with a reason) and 9001 supplies the verdict.
+  lookups.length = 0;
+  const green = await findTrustedVerdict(runs.filter((run) => run.id !== 9003), ctx, artifactNamesOf);
+  assert.equal(green.verdict.conclusion, "success");
+  assert.equal(green.verdict.runId, 9001);
+  assert.deepEqual(lookups, [9001], "untrusted runs are never asked for artifacts");
+  assert.match(green.rejected[0], /feat\/weaken-gate/);
+
+  // Runs created before the head landed are not consulted (8000 is never looked up).
+  lookups.length = 0;
+  const none = await findTrustedVerdict([runs[3]], ctx, artifactNamesOf);
+  assert.equal(none.verdict, null);
+  assert.equal(none.considered, 0);
+  assert.deepEqual(lookups, []);
+
+  // A trusted run that evaluated a different SHA yields nothing, not a borrowed verdict.
+  const other = await findTrustedVerdict([gateWorkflowRun({ id: 9005, created_at: "2026-09-15T05:45:00Z" })], ctx, async () => [`stage-gate-development-${"c".repeat(40)}-success`]);
+  assert.equal(other.verdict, null);
+  assert.equal(other.considered, 1);
+});
+
+test("displayCheckRun is display-only: it picks the check run whose external_id names the trusted run, or nothing", () => {
+  const forged = { ...greenGate, id: 50, external_id: "stage-gate:development", details_url: "https://example/forged" };
+  const other = { ...greenGate, id: 51, external_id: "stage-gate:development:1" };
+  assert.equal(displayCheckRun([forged, other, greenGate], { stage: "development", runId: Number(GATE_RUN_ID) }), greenGate);
+  assert.equal(displayCheckRun([forged, other], { stage: "development", runId: Number(GATE_RUN_ID) }), null);
+  assert.equal(displayCheckRun(null, { stage: "development", runId: 1 }), null);
 });
 
 test("includedPullNumbers reads merge and squash commits, ignores the rest", () => {
@@ -204,7 +251,7 @@ test("renderBody carries marker, gate evidence, included PRs, findings and the c
   const reviews = new Map([[410, reviewFindingsFromComments(baseRoutes()[`${REPO}/issues/410/comments`])]]);
   const body = renderBody({
     repo: REPO, source: "delivery", target: "main", headSha: HEAD, baseSha: TARGET,
-    gate: gateState(greenGate, { now: NOW }), commits: [{}, {}],
+    gate: { ...gateState(trustedVerdict, { now: NOW }), verdict: trustedVerdict, display: greenGate }, commits: [{}, {}],
     pulls: [{ number: 410, title: "feat: x | pipes" }, { number: 411, title: "fix(api): y" }],
     reviews, changelog: "## vNEXT\n- feat: x", autoMerge: false, runUrl: "https://run", now: NOW,
   });
@@ -217,9 +264,11 @@ test("renderBody carries marker, gate evidence, included PRs, findings and the c
   assert.match(body, /Important review findings carried into main \(1\)/);
   assert.match(body, /#410 `security` \*\*apps\/web\/a.ts\*\*:3 — raw SQL/);
   assert.match(body, /adds no diff of its own/);
-  const auto = renderBody({ repo: REPO, source: "development", target: "delivery", headSha: HEAD, baseSha: TARGET, gate: gateState(greenGate, { now: NOW }), commits: [], pulls: [], reviews: new Map(), changelog: "", autoMerge: true, now: NOW });
+  assert.match(body, /Provenance: the verdict is read from the Stage Gate workflow's own evaluation run 9001/);
+  const auto = renderBody({ repo: REPO, source: "development", target: "delivery", headSha: HEAD, baseSha: TARGET, gate: { ...gateState(trustedVerdict, { now: NOW }), verdict: trustedVerdict, display: null }, commits: [], pulls: [], reviews: new Map(), changelog: "", autoMerge: true, now: NOW });
   assert.match(auto, /\*\*Automatic\.\*\* Auto-merge is enabled/);
   assert.match(auto, /No pull request references found/);
+  assert.doesNotMatch(auto, /Loop-by-loop verdict quoted/, "no summary when no check run names the trusted run");
 });
 
 test("promote: nothing to promote when the target already contains the source", async () => {
@@ -229,17 +278,26 @@ test("promote: nothing to promote when the target already contains the source", 
   assert.ok(!api.calls.some((call) => call.method === "POST"));
 });
 
-test("promote: waits on a pending gate, stops on a red gate, opens nothing either way", async () => {
-  for (const [gate, status] of [[null, "gate-pending"], [{ ...greenGate, conclusion: "failure" }, "gate-red"], [{ ...greenGate, status: "in_progress", conclusion: null }, "gate-pending"]]) {
-    const api = fakeApi(baseRoutes({ gate }));
-    const result = await promote({ api, repo: REPO, source: "development", target: "delivery", gateName: "Stage Gate / development", now: NOW });
-    assert.equal(result.status, status);
-    assert.ok(!api.calls.some((call) => call.method === "POST" || call.method === "PATCH" || call.method === "GRAPHQL"), status);
+test("promote: waits on a pending or absent evaluation, stops on a red one, opens nothing either way — check runs play no part", async () => {
+  const cases = [
+    ["no evaluation yet", { workflowRuns: [] }, "gate-pending", /no trusted Stage Gate evaluation/],
+    ["evaluation pending", { artifacts: gateArtifacts("development", HEAD, "pending") }, "gate-pending", /waiting on required signals/],
+    ["evaluation red", { artifacts: gateArtifacts("development", HEAD, "failure") }, "gate-red", /concluded failure/],
+    ["evaluation of another SHA only", { artifacts: gateArtifacts("development", "c".repeat(40)) }, "gate-pending", /no trusted Stage Gate evaluation/],
+    ["only untrusted runs", { workflowRuns: [gateWorkflowRun({ event: "workflow_dispatch", head_branch: "feat/weaken-gate" })] }, "gate-pending", /1 not trusted: run 9001 ran from feat\/weaken-gate/],
+  ];
+  for (const [label, overrides, status, pattern] of cases) {
+    // A green check run is present in every case and must not matter.
+    const api = fakeApi(baseRoutes({ gate: greenGate, ...overrides }));
+    const result = await promote({ api, repo: REPO, source: "development", target: "delivery", gateName: "Stage Gate / development", autoMerge: true, now: NOW });
+    assert.equal(result.status, status, label);
+    assert.match(result.detail, pattern, label);
+    assert.ok(!api.calls.some((call) => call.method === "POST" || call.method === "PATCH" || call.method === "GRAPHQL"), label);
   }
 });
 
 test("promote: soak keeps delivery -> main waiting, counted from when the head landed on delivery", async () => {
-  const routes = baseRoutes();
+  const routes = baseRoutes({ artifacts: gateArtifacts("delivery") });
   routes[`${REPO}/compare/main...delivery`] = routes[`${REPO}/compare/delivery...development`];
   // Landed on delivery at 22:00 the day before; gate republished green at 05:00.
   routes[`${REPO}/branches/delivery`] = { commit: { sha: HEAD, commit: { committer: { date: LANDED_AT } } } };
@@ -257,29 +315,36 @@ test("promote: soak keeps delivery -> main waiting, counted from when the head l
   assert.equal(ready.status, "dry-run");
 });
 
-test("promote: a green gate whose provenance cannot be verified is gate-untrusted and opens nothing", async () => {
-  const forged = [
-    ["check run naming no run", { gate: { ...greenGate, id: 9, external_id: "stage-gate:development", details_url: "https://example/forged" } }, /names no producing workflow run/],
-    ["check run pointing at a PR-branch run with a weakened config", { workflowRun: gateWorkflowRun({ event: "workflow_dispatch", head_branch: "feat/weaken-gate" }) }, /feat\/weaken-gate/],
-    ["check run pointing at a fork PR run that uploaded the artifact", { workflowRun: gateWorkflowRun({ event: "pull_request", head_branch: "main", head_repository: { full_name: "someone/fork" } }) }, /pull_request/],
-    ["check run pointing at a legitimate run for another SHA", { artifacts: gateArtifacts("development", "c".repeat(40)) }, /uploaded no artifact/],
-    ["check run pointing at a legitimate run whose verdict was failure", { artifacts: gateArtifacts("development", HEAD, "failure") }, /-failure\)/],
-    ["check run pointing at a run that does not exist", { workflowRun: null, artifacts: null }, /does not exist/],
-  ];
-  for (const [label, overrides, pattern] of forged) {
-    const api = fakeApi(baseRoutes(overrides));
-    const result = await promote({ api, repo: REPO, source: "development", target: "delivery", gateName: "Stage Gate / development", autoMerge: true, now: NOW });
-    assert.equal(result.status, "gate-untrusted", label);
-    assert.equal(result.gate.provenance.trusted, false, label);
-    assert.match(result.gate.provenance.reason, pattern, label);
-    assert.match(result.warning, /provenance could not be verified/, label);
-    assert.ok(!api.calls.some((call) => call.method === "POST" || call.method === "PATCH" || call.method === "GRAPHQL"), label);
-  }
-  // A newer forged green run is the one judged (newest informative wins), so it cannot ride on an older legitimate run's verdict.
-  const routes = baseRoutes();
-  routes[`${REPO}/commits/${HEAD}/check-runs`] = { check_runs: [greenGate, { ...greenGate, id: 50, external_id: "stage-gate:development", details_url: "https://example/forged" }] };
-  const judged = await promote({ api: fakeApi(routes), repo: REPO, source: "development", target: "delivery", gateName: "Stage Gate / development", now: NOW });
-  assert.equal(judged.status, "gate-untrusted");
+test("promote: forged check runs cannot open the hop — the verdict is read from the newest trusted evaluation's artifact", async () => {
+  // Stale evidence: run 9001 evaluated this SHA green; a later run 9002 evaluated it red; an attacker mints a newer
+  // green check run whose external_id points at 9001. The bot follows the runs, not the check run: gate-red.
+  const routes = baseRoutes({
+    workflowRuns: [gateWorkflowRun({ id: 9001 }), gateWorkflowRun({ id: 9002, created_at: "2026-09-15T05:30:00Z" })],
+    extraArtifacts: { 9002: [`stage-gate-development-${HEAD}-failure`] },
+  });
+  routes[`${REPO}/commits/${HEAD}/check-runs`] = { check_runs: [greenGate, { ...greenGate, id: 99, completed_at: "2026-09-15T05:59:00Z" }] };
+  const stale = await promote({ api: fakeApi(routes), repo: REPO, source: "development", target: "delivery", gateName: "Stage Gate / development", autoMerge: true, now: NOW });
+  assert.equal(stale.status, "gate-red");
+  assert.equal(stale.gate.verdict.runId, 9002);
+
+  // No trusted evaluation at all, but a forged green check run naming a nonexistent run: gate-pending, nothing opened.
+  const forgedOnly = baseRoutes({ workflowRuns: [], gate: { ...greenGate, id: 9, external_id: "stage-gate:development:424242", details_url: "https://example/forged" } });
+  const api = fakeApi(forgedOnly);
+  const result = await promote({ api, repo: REPO, source: "development", target: "delivery", gateName: "Stage Gate / development", autoMerge: true, now: NOW });
+  assert.equal(result.status, "gate-pending");
+  assert.ok(!api.calls.some((call) => call.method !== "GET"));
+  // The bot never asked the API about the run the forged check run named.
+  assert.ok(!api.calls.some((call) => call.route === "/actions/runs/424242" || call.route === "/actions/runs/424242/artifacts"));
+
+  // A check run pointing at a fork PR run that uploaded a success artifact: that run is not in the default-branch
+  // Stage Gate run list (it is filtered out by untrustedGateRunReason even if it were), so it never counts.
+  const forkRun = gateWorkflowRun({ id: 9009, created_at: "2026-09-15T05:50:00Z", event: "pull_request", head_repository: { full_name: "someone/fork" } });
+  const viaFork = await promote({
+    api: fakeApi(baseRoutes({ workflowRuns: [forkRun], extraArtifacts: { 9009: [`stage-gate-development-${HEAD}-success`] } })),
+    repo: REPO, source: "development", target: "delivery", gateName: "Stage Gate / development", autoMerge: true, now: NOW,
+  });
+  assert.equal(viaFork.status, "gate-pending");
+  assert.match(viaFork.detail, /triggered by pull_request/);
 });
 
 test("promote: green development gate opens the PR, labels it and enables auto-merge", async () => {
@@ -293,10 +358,12 @@ test("promote: green development gate opens the PR, labels it and enables auto-m
   assert.equal(open.body.base, "delivery");
   assert.equal(open.body.title, promotionTitle("development", "delivery", HEAD));
   assert.ok(open.body.body.includes(PROMOTION_MARKER));
-  assert.match(open.body.body, new RegExp(`Provenance verified: verdict minted by ${DEFAULT_GATE_WORKFLOW.replace(/\\./g, "\\\\.")} run ${GATE_RUN_ID} on main`));
-  assert.equal(result.gate.provenance.trusted, true);
-  // The verification read the run and its artifacts, nothing more.
-  assert.ok(api.calls.some((call) => call.method === "GET" && call.route === `/actions/runs/${GATE_RUN_ID}`));
+  assert.match(open.body.body, new RegExp(`Provenance: the verdict is read from the Stage Gate workflow's own evaluation run ${GATE_RUN_ID} on the default branch and its artifact \`stage-gate-development-${HEAD}-success\``));
+  assert.match(open.body.body, /Loop-by-loop verdict quoted from the check run/, "the matching check run's summary is quoted for humans");
+  assert.deepEqual(result.gate.verdict, trustedVerdict);
+  assert.equal(result.gate.url, "https://example/gate", "links the display check run when its external_id names the trusted run");
+  // The verdict came from the workflow's runs and that run's artifacts.
+  assert.ok(api.calls.some((call) => call.method === "GET" && call.route === "/actions/workflows/stage-gate.yml/runs" && call.params.branch === "main"));
   assert.ok(api.calls.some((call) => call.method === "GET" && call.route === `/actions/runs/${GATE_RUN_ID}/artifacts`));
   const labels = api.calls.find((call) => call.method === "POST" && call.route === "/issues/77/labels");
   assert.deepEqual(labels.body.labels, ["promotion", "stage:delivery"]);

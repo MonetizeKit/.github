@@ -19,7 +19,19 @@
 //
 // A required signal that failed makes the gate `failure`; a required signal
 // that has not reported yet leaves the gate `in_progress` (pending); anything
-// else is `success`. Advisory signals (`required: false`) are reported in the
+// else is `success`.
+//
+// Observer check runs are bound, not trusted by name. Any workflow with
+// `checks: write` can mint a check run under any name on the stage SHA, so a
+// `check-run`/`branch-head` signal is honored only when the check run is a
+// GitHub Actions *job* (details_url `/actions/runs/<run>/job/<job>`) whose job
+// object — which only GitHub writes — has this SHA and this name, and whose
+// workflow run is this repository's own code (not a fork, not a pull_request
+// event). The job's status/conclusion is the verdict, not the check run's. A
+// check run that cannot be bound (published via the API, or pointing at a job
+// for another SHA) counts as *not reported*: it keeps a required signal pending
+// and is annotated "unverified" on an advisory one. `workflow-run` signals skip
+// runs from forks or pull_request events for the same reason. Advisory signals (`required: false`) are reported in the
 // summary and never move the conclusion — that is the shadow → gate path.
 //
 //   node evaluate.mjs --repo OWNER/REPO --stage development \
@@ -134,10 +146,49 @@ export function validateConfig(config) {
 // Gate" to the same commit after the push run's real verdict. Prefer runs that
 // actually concluded something; fall back to the newest otherwise.
 export function latestCheckRun(runs) {
-  if (!runs?.length) return null;
+  return informativeCheckRuns(runs)[0] ?? null;
+}
+
+/** Check runs newest first, informative (non skipped/neutral) ones before the rest. */
+export function informativeCheckRuns(runs) {
+  if (!runs?.length) return [];
   const byNewest = [...runs].sort((a, b) => (b.id ?? 0) - (a.id ?? 0));
   const informative = byNewest.filter((run) => run.status !== "completed" || !["skipped", "neutral"].includes(run.conclusion));
-  return informative[0] ?? byNewest[0];
+  return informative.length ? informative : byNewest.slice(0, 1);
+}
+
+export const UNTRUSTED_OBSERVER_EVENTS = Object.freeze(["pull_request", "pull_request_target"]);
+
+/** `/actions/runs/<run>/job/<job>` from a check run's details_url; job-less URLs mean the check run was published via the API. */
+export function checkRunSource(checkRun) {
+  const match = /\/actions\/runs\/(\d+)(?:\/jobs?\/(\d+))?(?:[/?#]|$)/.exec(checkRun?.details_url ?? "");
+  if (!match) return null;
+  return { runId: match[1], jobId: match[2] ?? null };
+}
+
+/**
+ * Bind a check run to the job and workflow run that produced it. Pure: the
+ * caller fetches `job` (GET /actions/jobs/<id>) and `workflowRun`
+ * (GET /actions/runs/<id>). When bound, the job's status/conclusion is the
+ * verdict; the check run's own fields are never used for the decision.
+ * @returns {{ bound: boolean, reason?: string, status?: string, conclusion?: string|null }}
+ */
+export function bindCheckRun({ checkRun, job, workflowRun, repo, sha, name }) {
+  const source = checkRunSource(checkRun);
+  if (!source) return { bound: false, reason: "check run names no workflow run (details_url); it was not produced by GitHub Actions" };
+  if (!source.jobId) return { bound: false, reason: `check run was published via the API by run ${source.runId}, not as a workflow job; its verdict cannot be verified` };
+  if (!job) return { bound: false, reason: `job ${source.jobId} named by the check run does not exist` };
+  if ((job.head_sha ?? "").toLowerCase() !== sha.toLowerCase()) return { bound: false, reason: `job ${source.jobId} ran for ${(job.head_sha ?? "?").slice(0, 7)}, not this head` };
+  if (job.name !== name) return { bound: false, reason: `job ${source.jobId} is "${job.name}", not "${name}"` };
+  if (String(job.run_id) !== String(source.runId)) return { bound: false, reason: `job ${source.jobId} belongs to run ${job.run_id}, not run ${source.runId} named by the check run` };
+  if (!workflowRun) return { bound: false, reason: `workflow run ${source.runId} does not exist` };
+  const owner = (workflowRun.repository?.full_name ?? "").toLowerCase();
+  const headRepo = (workflowRun.head_repository?.full_name ?? workflowRun.repository?.full_name ?? "").toLowerCase();
+  if (owner !== repo.toLowerCase()) return { bound: false, reason: `run ${source.runId} belongs to ${workflowRun.repository?.full_name ?? "another repository"}, not ${repo}` };
+  if (headRepo !== repo.toLowerCase()) return { bound: false, reason: `run ${source.runId} ran code from ${workflowRun.head_repository?.full_name ?? "an unknown repository"} (fork), not ${repo}` };
+  if (UNTRUSTED_OBSERVER_EVENTS.includes(workflowRun.event)) return { bound: false, reason: `run ${source.runId} was triggered by ${workflowRun.event}; pull request runs cannot observe a stage head` };
+  if ((workflowRun.head_sha ?? "").toLowerCase() !== sha.toLowerCase()) return { bound: false, reason: `run ${source.runId} ran for ${(workflowRun.head_sha ?? "?").slice(0, 7)}, not this head` };
+  return { bound: true, status: job.status, conclusion: job.conclusion ?? null, runId: source.runId, jobId: source.jobId };
 }
 
 export function classifyCheckRun(run) {
@@ -151,15 +202,44 @@ export function classifyCheckRun(run) {
   return { state: "pending", detail: `unrecognised conclusion ${run.conclusion}`, url: run.html_url };
 }
 
+/**
+ * The verdict of a named observer on a SHA: the newest informative check run
+ * that binds to a genuine job of this repository's own workflow run for that
+ * SHA. Unbound check runs are skipped; if none binds, the signal is pending
+ * with the newest one's reason, so a forged check run can neither pass nor
+ * fail a stage.
+ */
 async function checkRunOnSha(api, repo, sha, name) {
   const data = await api.getJson(repo, `/commits/${sha}/check-runs`, { check_name: name, per_page: 50 });
-  return classifyCheckRun(latestCheckRun(data?.check_runs));
+  const candidates = informativeCheckRuns(data?.check_runs);
+  if (candidates.length === 0) return classifyCheckRun(null);
+  const runCache = new Map();
+  let firstReason = null;
+  for (const checkRun of candidates.slice(0, 5)) {
+    const source = checkRunSource(checkRun);
+    const job = source?.jobId ? await api.getJson(repo, `/actions/jobs/${source.jobId}`) : null;
+    let workflowRun = null;
+    if (source?.runId && job) {
+      if (!runCache.has(source.runId)) runCache.set(source.runId, await api.getJson(repo, `/actions/runs/${source.runId}`));
+      workflowRun = runCache.get(source.runId);
+    }
+    const binding = bindCheckRun({ checkRun, job, workflowRun, repo, sha, name });
+    if (binding.bound) {
+      const verdict = classifyCheckRun({ status: binding.status, conclusion: binding.conclusion, html_url: checkRun.html_url });
+      return { ...verdict, detail: `${verdict.detail} (job ${binding.jobId} of run ${binding.runId})`, bound: true };
+    }
+    firstReason ??= binding.reason;
+  }
+  return { state: "pending", detail: `${candidates.length} check run(s) named "${name}" on this commit, none verifiable: ${firstReason}`, url: candidates[0].html_url, bound: false };
 }
 
-export function classifyWorkflowRuns(runs, { now, maxAgeHours = 36, afterHead = false, headCommittedAt, absent = "pending" }) {
+export function classifyWorkflowRuns(runs, { now, maxAgeHours = 36, afterHead = false, headCommittedAt, absent = "pending", repo }) {
   const cutoff = now - maxAgeHours * 3600_000;
   const considered = (runs ?? [])
     .filter((run) => run.status === "completed" && run.conclusion !== "cancelled" && run.conclusion !== "skipped")
+    // Only this repository's own code observing the stage: not a fork, not a pull request run.
+    .filter((run) => !UNTRUSTED_OBSERVER_EVENTS.includes(run.event))
+    .filter((run) => !repo || !run.head_repository?.full_name || run.head_repository.full_name.toLowerCase() === repo.toLowerCase())
     .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
   const latest = considered[0];
   if (!latest || Date.parse(latest.created_at) < cutoff) {
@@ -250,6 +330,7 @@ export async function evaluateSignal(api, signal, context) {
           event: signal.event,
         });
         return classifyWorkflowRuns(data?.workflow_runs, {
+          repo,
           now: context.now,
           maxAgeHours: signal.maxAgeHours,
           afterHead: signal.afterHead ?? false,

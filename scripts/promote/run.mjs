@@ -22,17 +22,19 @@
 // target `delivery` or `main` directly are failed by the `promotion-guard`
 // check (scripts/promote/guard.mjs).
 //
-// Provenance. A green check run named `Stage Gate / <stage>` is not, by itself,
-// authorization: any workflow in the repository runs as the same GitHub Actions
-// app and can mint a check run under any name on any SHA. Before honoring a
-// green gate the bot resolves the workflow run the check run points at and
-// requires that it (a) is this repository's Stage Gate workflow, (b) ran on the
-// default branch from this repository (not a PR, not a fork), (c) completed
-// successfully, and (d) uploaded the evidence artifact
-// `stage-gate-<stage>-<head sha>-success`. Artifacts can only be created by the
-// run that owns them, so a forged check run cannot borrow another run's verdict
-// unless that run really evaluated this SHA to success — in which case the gate
-// is genuinely green. Anything else is `gate-untrusted` and nothing is opened.
+// Provenance. A check run named `Stage Gate / <stage>` is not authorization:
+// any workflow in the repository runs as the same GitHub Actions app and can
+// mint a check run under any name on any SHA, pointing wherever it likes. So
+// the bot does not read the verdict from the check run at all. It reads it
+// from the newest trusted evaluation: the workflow runs of the caller's Stage
+// Gate workflow (`--gate-workflow`) on the default branch, from this
+// repository, triggered by a trusted event and completed successfully, newest
+// first, and the first one that uploaded an evidence artifact
+// `stage-gate-<stage>-<head sha>-<conclusion>` supplies the conclusion.
+// Artifacts can only be created by the run that owns them, and taking the
+// newest evaluation means an older success cannot be replayed after a later
+// evaluation went red. The check run is used for display only (its summary is
+// quoted into the PR) and only when its external_id names that same run.
 //
 // Soak. `--soak-minutes` counts from when the source head LANDED on the source
 // branch (its commit date), not from the newest gate run: the gate republishes
@@ -115,79 +117,105 @@ export function createGitHubApi({ token, writeToken, fetchImpl = fetch, baseUrl 
 // Decisions (pure)
 // --------------------------------------------------------------------------
 
-export function latestCheckRun(runs) {
-  if (!runs?.length) return null;
-  const byNewest = [...runs].sort((a, b) => (b.id ?? 0) - (a.id ?? 0));
-  const informative = byNewest.filter((run) => run.status !== "completed" || !["skipped", "neutral"].includes(run.conclusion));
-  return informative[0] ?? byNewest[0];
+
+/** `stage-gate-<stage>-<sha>-<conclusion>` — parse the conclusion an evidence artifact carries for this stage and SHA. */
+export function gateEvidence(artifactNames, { stage, headSha }) {
+  const prefix = `stage-gate-${stage}-${headSha}-`;
+  for (const name of artifactNames ?? []) {
+    if (typeof name === "string" && name.startsWith(prefix)) {
+      const conclusion = name.slice(prefix.length);
+      if (["success", "failure", "pending"].includes(conclusion)) return { conclusion, artifact: name };
+    }
+  }
+  return null;
+}
+
+/**
+ * Why a workflow run may NOT be trusted as a Stage Gate evaluation, or null
+ * when it may: this repository's `gateWorkflow`, on the default branch, from
+ * this repository (no fork code), a trusted event, completed successfully.
+ */
+export function untrustedGateRunReason(workflowRun, { repo, defaultBranch, gateWorkflow = DEFAULT_GATE_WORKFLOW }) {
+  if (!workflowRun) return "no workflow run";
+  const id = workflowRun.id ?? "?";
+  if ((workflowRun.repository?.full_name ?? "").toLowerCase() !== repo.toLowerCase()) return `run ${id} belongs to ${workflowRun.repository?.full_name ?? "another repository"}, not ${repo}`;
+  if (workflowRun.path !== gateWorkflow) return `run ${id} is ${workflowRun.path ?? "an unknown workflow"}, not ${gateWorkflow}`;
+  if (!TRUSTED_GATE_EVENTS.includes(workflowRun.event)) return `run ${id} was triggered by ${workflowRun.event ?? "an unknown event"}; the gate is only minted by ${TRUSTED_GATE_EVENTS.join("/")}`;
+  if (workflowRun.head_branch !== defaultBranch) return `run ${id} ran from ${workflowRun.head_branch ?? "an unknown branch"}, not the default branch ${defaultBranch}`;
+  const headRepo = workflowRun.head_repository?.full_name ?? workflowRun.repository?.full_name ?? "";
+  if (headRepo.toLowerCase() !== repo.toLowerCase()) return `run ${id} ran code from ${headRepo || "an unknown repository"} (fork), not ${repo}`;
+  if (workflowRun.status !== "completed" || workflowRun.conclusion !== "success") return `run ${id} is ${workflowRun.status}/${workflowRun.conclusion ?? "-"}, not completed/success`;
+  return null;
+}
+
+/**
+ * The newest trusted evaluation of this head, from the Stage Gate workflow's
+ * own runs and artifacts — never from a check run. Pure over the fetched runs
+ * and an artifact lookup.
+ * @param {object[]} workflowRuns newest first
+ * @param {(runId: number|string) => Promise<string[]>} artifactNamesOf
+ * @returns {Promise<{ verdict: null|{conclusion:string, runId:number, runUrl:string, artifact:string, completedAt:string}, considered:number, rejected:string[] }>}
+ */
+export async function findTrustedVerdict(workflowRuns, { repo, defaultBranch, gateWorkflow, stage, headSha, landedAt, maxRuns = 60 }, artifactNamesOf) {
+  const landed = Date.parse(landedAt ?? "");
+  const rejected = [];
+  let considered = 0;
+  const ordered = [...(workflowRuns ?? [])].sort((a, b) => (b.id ?? 0) - (a.id ?? 0));
+  for (const run of ordered) {
+    if (considered >= maxRuns) break;
+    // A run that started before the head existed cannot have evaluated it.
+    if (Number.isFinite(landed) && Date.parse(run.created_at ?? "") < landed) break;
+    considered += 1;
+    const reason = untrustedGateRunReason(run, { repo, defaultBranch, gateWorkflow });
+    if (reason) {
+      rejected.push(reason);
+      continue;
+    }
+    const evidence = gateEvidence(await artifactNamesOf(run.id), { stage, headSha });
+    if (!evidence) continue;
+    return {
+      verdict: { conclusion: evidence.conclusion, runId: run.id, runUrl: run.html_url ?? null, artifact: evidence.artifact, completedAt: run.updated_at ?? run.created_at ?? null },
+      considered,
+      rejected,
+    };
+  }
+  return { verdict: null, considered, rejected };
 }
 
 /**
  * Is the gate green for this head, and has the soak elapsed?
  *
  * The soak is anchored on `soakFrom` — when the head landed on the source
- * branch — because the gate publishes a fresh check run on every evaluation
- * (every 30 minutes on the schedule); anchoring on the run's `completed_at`
- * would restart the clock each time and a soak longer than one cycle would
- * never end. Falls back to `completed_at` only when no landing time is known.
- * @returns {{ state: "green"|"red"|"pending"|"soaking", detail: string, run?: object, readyAt?: string }}
+ * branch — because the gate re-evaluates every 30 minutes; anchoring on the
+ * evaluation time would restart the clock each cycle and a soak longer than
+ * one cycle would never end. Falls back to the evaluation time only when no
+ * landing time is known.
+ * @param {null|{conclusion:string, completedAt?:string}} verdict the trusted evaluation
+ * @returns {{ state: "green"|"red"|"pending"|"soaking", detail: string, readyAt?: string }}
  */
-export function gateState(run, { soakMinutes = 0, now = Date.now(), soakFrom } = {}) {
-  if (!run) return { state: "pending", detail: "the gate has not reported for this head yet" };
-  if (run.status !== "completed") return { state: "pending", detail: `the gate is ${run.status}`, run };
-  if (run.conclusion !== "success") {
-    return { state: FAILED_CONCLUSIONS.has(run.conclusion) ? "red" : "pending", detail: `the gate concluded ${run.conclusion}`, run };
-  }
+export function gateState(verdict, { soakMinutes = 0, now = Date.now(), soakFrom } = {}) {
+  if (!verdict) return { state: "pending", detail: "no trusted Stage Gate evaluation of this head yet" };
+  if (verdict.conclusion === "pending") return { state: "pending", detail: `the newest trusted evaluation (run ${verdict.runId}) is waiting on required signals` };
+  if (verdict.conclusion !== "success") return { state: "red", detail: `the newest trusted evaluation (run ${verdict.runId}) concluded ${verdict.conclusion}` };
   const landedAt = Date.parse(soakFrom ?? "");
-  const anchor = Number.isFinite(landedAt) ? { at: landedAt, what: "the head landed" } : { at: Date.parse(run.completed_at ?? ""), what: "the gate went green" };
+  const anchor = Number.isFinite(landedAt) ? { at: landedAt, what: "the head landed" } : { at: Date.parse(verdict.completedAt ?? ""), what: "the gate went green" };
   if (soakMinutes > 0 && Number.isFinite(anchor.at)) {
     const readyAt = anchor.at + soakMinutes * 60_000;
     if (readyAt > now) {
       return {
         state: "soaking",
-        detail: `${anchor.what} at ${new Date(anchor.at).toISOString()}; soaking until ${new Date(readyAt).toISOString()} (gate green since ${run.completed_at})`,
-        run,
+        detail: `${anchor.what} at ${new Date(anchor.at).toISOString()}; soaking until ${new Date(readyAt).toISOString()} (gate green in run ${verdict.runId})`,
         readyAt: new Date(readyAt).toISOString(),
       };
     }
   }
-  return { state: "green", detail: `the gate is green (${run.completed_at})`, run };
+  return { state: "green", detail: `the gate is green (trusted evaluation run ${verdict.runId}, evidence ${verdict.artifact})` };
 }
 
-/** Workflow run id a Stage Gate check run points at: `external_id` `stage-gate:<stage>:<id>`, else `details_url` `.../actions/runs/<id>`. */
-export function gateRunId(run) {
-  const fromExternal = /^stage-gate:[a-z]+:(\d+)$/.exec(run?.external_id ?? "");
-  if (fromExternal) return fromExternal[1];
-  const fromDetails = /\/actions\/runs\/(\d+)(?:[/?#]|$)/.exec(run?.details_url ?? "");
-  return fromDetails ? fromDetails[1] : null;
-}
-
-/**
- * Does this green check run come from the repository's own Stage Gate workflow,
- * run on the default branch from this repository, which uploaded the evidence
- * artifact for exactly this stage, SHA and conclusion? Pure: the caller fetches
- * the workflow run and its artifact list.
- * @returns {{ trusted: boolean, reason: string, runId: string|null }}
- */
-export function gateProvenance({ checkRun, workflowRun, artifacts, repo, defaultBranch, stage, headSha, gateWorkflow = DEFAULT_GATE_WORKFLOW }) {
-  const runId = gateRunId(checkRun);
-  const untrusted = (reason) => ({ trusted: false, reason, runId });
-  if (!runId) return untrusted("the check run names no producing workflow run (no external_id/details_url run id)");
-  if (!workflowRun) return untrusted(`workflow run ${runId} named by the check run does not exist in ${repo}`);
-  if ((workflowRun.repository?.full_name ?? "").toLowerCase() !== repo.toLowerCase()) return untrusted(`workflow run ${runId} belongs to ${workflowRun.repository?.full_name ?? "another repository"}, not ${repo}`);
-  if (workflowRun.path !== gateWorkflow) return untrusted(`workflow run ${runId} is ${workflowRun.path ?? "an unknown workflow"}, not ${gateWorkflow}`);
-  if (!TRUSTED_GATE_EVENTS.includes(workflowRun.event)) return untrusted(`workflow run ${runId} was triggered by ${workflowRun.event ?? "an unknown event"}; the gate is only minted by ${TRUSTED_GATE_EVENTS.join("/")}`);
-  if (workflowRun.head_branch !== defaultBranch) return untrusted(`workflow run ${runId} ran from ${workflowRun.head_branch ?? "an unknown branch"}, not the default branch ${defaultBranch}`);
-  const headRepo = workflowRun.head_repository?.full_name ?? workflowRun.repository?.full_name ?? "";
-  if (headRepo.toLowerCase() !== repo.toLowerCase()) return untrusted(`workflow run ${runId} ran code from ${headRepo || "an unknown repository"} (fork), not ${repo}`);
-  if (workflowRun.status !== "completed" || workflowRun.conclusion !== "success") return untrusted(`workflow run ${runId} is ${workflowRun.status}/${workflowRun.conclusion ?? "-"}, not completed/success`);
-  const expected = `stage-gate-${stage}-${headSha}-success`;
-  const names = (artifacts ?? []).map((artifact) => artifact.name);
-  if (!names.includes(expected)) {
-    const related = names.filter((name) => name.startsWith(`stage-gate-${stage}-`));
-    return untrusted(`workflow run ${runId} uploaded no artifact ${expected}${related.length ? ` (it has ${related.join(", ")})` : " (it evaluated nothing for this SHA)"}`);
-  }
-  return { trusted: true, reason: `verdict minted by ${gateWorkflow} run ${runId} on ${defaultBranch}, evidence ${expected}`, runId };
+/** Display-only: the check run whose external_id names the trusted run, for its summary and link. Never a source of truth. */
+export function displayCheckRun(checkRuns, { stage, runId }) {
+  const expected = `stage-gate:${stage}:${runId}`;
+  return (checkRuns ?? []).find((run) => run.external_id === expected) ?? null;
 }
 
 /** Pull request numbers referenced by merge and squash commits in the range. */
@@ -257,13 +285,13 @@ export function renderBody({ repo, source, target, headSha, baseSha, gate, commi
     lines.push("**Prepared for human authorization.** This PR is never merged by automation. A code-owner approval is the release gate; approving and merging is the act of releasing.");
   }
   lines.push("");
-  lines.push(`## Gate evidence — ${gate.run?.name ?? "Stage Gate"}`);
+  lines.push(`## Gate evidence — ${gate.display?.name ?? "Stage Gate"}`);
   lines.push("");
-  lines.push(`${gate.detail}${gate.run?.html_url ? ` ([check run](${gate.run.html_url}))` : ""}.`);
-  if (gate.provenance?.trusted) {
-    lines.push("", `Provenance verified: ${gate.provenance.reason}.`);
+  lines.push(`${gate.detail}${gate.display?.html_url ? ` ([check run](${gate.display.html_url}))` : ""}${gate.verdict?.runUrl ? ` ([evaluation run](${gate.verdict.runUrl}))` : ""}.`);
+  if (gate.verdict) {
+    lines.push("", `Provenance: the verdict is read from the Stage Gate workflow's own evaluation run ${gate.verdict.runId} on the default branch and its artifact \`${gate.verdict.artifact}\`, not from a check run.`);
   }
-  const summary = gate.run?.output?.summary?.trim();
+  const summary = gate.display?.output?.summary?.trim();
   if (summary) {
     lines.push("", "<details><summary>Loop-by-loop verdict quoted from the check run</summary>", "", summary, "", "</details>");
   }
@@ -366,32 +394,42 @@ export async function promote({ api, repo, source, target, gateName, gateWorkflo
     return result;
   }
 
-  const checks = await api.getJson(repo, `/commits/${headSha}/check-runs`, { check_name: gateName, per_page: 50 });
-  const gate = gateState(latestCheckRun(checks?.check_runs), { soakMinutes, now, soakFrom: landedAt });
-  result.gate = { state: gate.state, detail: gate.detail, url: gate.run?.html_url ?? null, readyAt: gate.readyAt ?? null, provenance: null };
-  if (gate.state !== "green") {
-    result.status = `gate-${gate.state}`;
-    result.detail = `${gateName} on ${headSha.slice(0, 7)}: ${gate.detail}`;
-    return result;
-  }
-
-  // Green by name is not green by right: bind the verdict to the Stage Gate
-  // workflow run that minted it before acting on it.
   const repository = await api.getJson(repo, "");
   const defaultBranch = repository?.default_branch;
   if (!defaultBranch) throw new Error(`${repo}: could not resolve the default branch`);
-  const runId = gateRunId(gate.run);
-  const workflowRun = runId ? await api.getJson(repo, `/actions/runs/${runId}`) : null;
-  const artifactPage = runId && workflowRun ? await api.getJson(repo, `/actions/runs/${runId}/artifacts`, { per_page: 100 }) : null;
-  const provenance = gateProvenance({ checkRun: gate.run, workflowRun, artifacts: artifactPage?.artifacts ?? [], repo, defaultBranch, stage: source, headSha, gateWorkflow });
-  result.gate.provenance = provenance;
-  if (!provenance.trusted) {
-    result.status = "gate-untrusted";
-    result.detail = `${gateName} on ${headSha.slice(0, 7)} is green but its provenance could not be verified: ${provenance.reason}. Nothing was opened. A check run under this name that did not come from ${gateWorkflow} on ${defaultBranch} is either a misconfiguration or an attempt to skip the chain — investigate before re-running.`;
-    result.warning = result.detail;
+
+  // The verdict comes from the Stage Gate workflow's own runs and artifacts —
+  // see the header. Check runs are read afterwards, for display only.
+  const workflowFile = gateWorkflow.split("/").pop();
+  const runsPage = await api.getJson(repo, `/actions/workflows/${encodeURIComponent(workflowFile)}/runs`, { branch: defaultBranch, status: "completed", per_page: 100 });
+  const trusted = await findTrustedVerdict(
+    runsPage?.workflow_runs ?? [],
+    { repo, defaultBranch, gateWorkflow, stage: source, headSha, landedAt },
+    async (runId) => ((await api.getJson(repo, `/actions/runs/${runId}/artifacts`, { per_page: 100 }))?.artifacts ?? []).map((artifact) => artifact.name),
+  );
+  const gate = gateState(trusted.verdict, { soakMinutes, now, soakFrom: landedAt });
+  gate.verdict = trusted.verdict;
+  if (trusted.verdict) {
+    const checks = await api.getJson(repo, `/commits/${headSha}/check-runs`, { check_name: gateName, per_page: 50 });
+    gate.display = displayCheckRun(checks?.check_runs, { stage: source, runId: trusted.verdict.runId });
+  }
+  result.gate = {
+    state: gate.state,
+    detail: gate.detail,
+    url: gate.display?.html_url ?? gate.verdict?.runUrl ?? null,
+    readyAt: gate.readyAt ?? null,
+    verdict: trusted.verdict,
+    considered: trusted.considered,
+    rejected: trusted.rejected,
+  };
+  if (gate.state !== "green") {
+    result.status = `gate-${gate.state}`;
+    result.detail = `${gateName} on ${headSha.slice(0, 7)}: ${gate.detail}`;
+    if (!trusted.verdict) {
+      result.detail += ` (${trusted.considered} ${gateWorkflow} run(s) on ${defaultBranch} since the head landed${trusted.rejected.length ? `; ${trusted.rejected.length} not trusted: ${trusted.rejected.slice(0, 3).join("; ")}` : ""})`;
+    }
     return result;
   }
-  gate.provenance = provenance;
 
   const numbers = includedPullNumbers(range.commits).slice(0, MAX_INCLUDED_PRS);
   const pulls = [];
@@ -501,7 +539,8 @@ async function main() {
   if (process.env.GITHUB_STEP_SUMMARY) {
     const lines = [`## Promotion ${source} -> ${target}`, "", `**${result.status}** — ${result.detail ?? ""}`, ""];
     if (result.gate) lines.push(`Gate: ${result.gate.state} — ${result.gate.detail}${result.gate.url ? ` ([check run](${result.gate.url}))` : ""}`, "");
-    if (result.gate?.provenance) lines.push(`Provenance: ${result.gate.provenance.trusted ? "verified" : "NOT verified"} — ${result.gate.provenance.reason}`, "");
+    if (result.gate?.verdict) lines.push(`Provenance: verdict from ${result.gate.verdict.artifact} in run ${result.gate.verdict.runId}${result.gate.verdict.runUrl ? ` (${result.gate.verdict.runUrl})` : ""}`, "");
+    if (result.gate?.rejected?.length) lines.push(`Untrusted runs skipped: ${result.gate.rejected.length}`, "");
     if (result.pr) lines.push(`PR: ${result.pr.url}`, "");
     if (result.warning) lines.push(`> ${result.warning}`, "");
     if (body && result.status === "dry-run") lines.push("<details><summary>Body that would be posted</summary>", "", body, "", "</details>");

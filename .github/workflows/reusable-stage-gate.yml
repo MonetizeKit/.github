@@ -23,8 +23,9 @@
 # evaluates and reports but never publishes), the configuration is read from
 # the default branch rather than the calling ref (a PR branch cannot weaken
 # it), and the evidence artifact is named `stage-gate-<stage>-<sha>-<conclusion>`
-# so the promotion bot can confirm, by listing this run's artifacts, that this
-# workflow on the default branch evaluated that exact SHA to `success`.
+# — the promotion bot reads its verdict from the newest such artifact across
+# this workflow's default-branch runs, never from the check run. Observer check
+# runs are likewise bound to the Actions job that produced them (evaluate.mjs).
 name: Reusable Stage Gate
 
 on:

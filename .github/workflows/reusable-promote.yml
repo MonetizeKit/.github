@@ -12,18 +12,20 @@
 #                             code-owner approval on main is the release gate.
 #
 # The bot (scripts/promote/run.mjs, agent-policy role `promotion-bot`) reads
-# the stage gate check run and nothing else — and does not take the check run
-# at its word. A green `Stage Gate / <stage>` is honored only after the bot
-# resolves the workflow run that minted it and confirms it is the caller's
-# `.github/workflows/stage-gate.yml` (`gate_workflow`), run on the default
-# branch from this repository, completed successfully, and that it uploaded the
-# evidence artifact `stage-gate-<stage>-<sha>-success` for exactly this head.
-# Any workflow with `checks: write` can mint a check run under any name; only
-# the producing run can create its own artifacts. A green check run that fails
-# this is `gate-untrusted`: nothing is opened and the run warns. Needs
-# `actions: read` on the caller's job. It has no route to main: the workflow
-# token cannot bypass branch protection, and `reusable-promotion-guard` fails
-# any PR into delivery/main that is not the expected upstream stage.
+# the stage gate and nothing else — and not from the check run. Any workflow
+# with `checks: write` can mint a check run under any name, pointing anywhere,
+# so the verdict is read from the Stage Gate workflow's own runs: the runs of
+# the caller's `gate_workflow` (default `.github/workflows/stage-gate.yml`) on
+# the default branch, from this repository, trusted event, completed
+# successfully, newest first; the first one carrying an evidence artifact
+# `stage-gate-<stage>-<head sha>-<conclusion>` supplies the conclusion. Only a
+# run can create its own artifacts, and reading the newest evaluation means an
+# older success cannot be replayed after a later one went red. The check run is
+# quoted in the PR for humans only, and only when its external_id names that
+# run. No trusted evaluation -> `gate-pending`. Needs `actions: read` on the
+# caller's job. It has no route to main: the workflow token cannot bypass
+# branch protection, and `reusable-promotion-guard` fails any PR into
+# delivery/main that is not the expected upstream stage.
 #
 # `soak_minutes` counts from when the source head landed on its branch (the
 # merge commit's date), not from the newest gate run — the gate republishes on
@@ -50,7 +52,7 @@ on:
         type: string
         default: ""
       gate_workflow:
-        description: Path (in the caller repo) of the workflow that legitimately mints the gate check run; a green check run from anything else is untrusted
+        description: Path (in the caller repo) of the Stage Gate workflow whose default-branch runs and evidence artifacts are the verdict
         type: string
         default: ".github/workflows/stage-gate.yml"
       soak_minutes:
@@ -79,7 +81,7 @@ on:
         required: false
     outputs:
       status:
-        description: nothing-to-promote | gate-pending | gate-red | gate-soaking | gate-untrusted | opened | updated | dry-run
+        description: nothing-to-promote | gate-pending | gate-red | gate-soaking | opened | updated | dry-run
         value: ${{ jobs.promote.outputs.status }}
       pr_url:
         description: URL of the promotion PR when one was opened or updated
