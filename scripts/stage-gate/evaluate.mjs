@@ -26,12 +26,18 @@
 // `check-run`/`branch-head` signal is honored only when the check run is a
 // GitHub Actions *job* (details_url `/actions/runs/<run>/job/<job>`) whose job
 // object — which only GitHub writes — has this SHA and this name, and whose
-// workflow run is this repository's own code (not a fork, not a pull_request
-// event). The job's status/conclusion is the verdict, not the check run's. A
+// workflow run is a run of exactly the declared `workflow` path, from this
+// repository's own code (not a fork, not a pull_request event), for this SHA.
+// Pinning the path is what stops a second workflow with a same-named job from
+// standing in for the observer: only someone who can change the observer
+// workflow file itself can change its verdict, which is the CI trust boundary
+// anyway. The job's status/conclusion is the verdict, not the check run's. A
 // check run that cannot be bound (published via the API, or pointing at a job
 // for another SHA) counts as *not reported*: it keeps a required signal pending
-// and is annotated "unverified" on an advisory one. `workflow-run` signals skip
-// runs from forks or pull_request events for the same reason. Advisory signals (`required: false`) are reported in the
+// and never passes or fails it. `workflow-run` signals likewise count only runs
+// of exactly `.github/workflows/<workflow>` from the target repository's own
+// code on its default branch (or the declared `branch`), so a stub of the
+// observer on a feature branch is not an observation. Advisory signals (`required: false`) are reported in the
 // summary and never move the conclusion — that is the shadow → gate path.
 //
 //   node evaluate.mjs --repo OWNER/REPO --stage development \
@@ -49,6 +55,12 @@ export const STAGES = Object.freeze(["development", "delivery"]);
 export const CHECK_NAME_PREFIX = "Stage Gate / ";
 const SHA_PATTERN = /\b[0-9a-f]{7,40}\b/g;
 const FAILED_CONCLUSIONS = new Set(["failure", "timed_out", "cancelled", "action_required", "startup_failure", "stale"]);
+const WORKFLOW_PATH = /^\.github\/workflows\/[^/]+\.ya?ml$/;
+
+/** `nightly.yml` -> `.github/workflows/nightly.yml`; a path is returned as is. */
+export function workflowPath(workflow) {
+  return workflow.includes("/") ? workflow : `.github/workflows/${workflow}`;
+}
 
 // --------------------------------------------------------------------------
 // GitHub API access (injectable for tests)
@@ -114,6 +126,7 @@ export function validateConfig(config) {
       switch (signal?.type) {
         case "check-run":
           if (!signal.name) errors.push(`${label}: check-run needs name`);
+          if (!WORKFLOW_PATH.test(signal.workflow ?? "")) errors.push(`${label}: check-run needs workflow (path like .github/workflows/ci.yml of the workflow whose job produces the check)`);
           break;
         case "workflow-run":
           if (!signal.workflow) errors.push(`${label}: workflow-run needs workflow (file name)`);
@@ -123,6 +136,7 @@ export function validateConfig(config) {
         case "branch-head":
           if (!signal.repo) errors.push(`${label}: branch-head needs repo`);
           if (!signal.branch) errors.push(`${label}: branch-head needs branch`);
+          if (!WORKFLOW_PATH.test(signal.workflow ?? "")) errors.push(`${label}: branch-head needs workflow (path like .github/workflows/ci.yml in that repository)`);
           break;
         case "drift-clear":
           if (!Array.isArray(signal.labels) || signal.labels.length === 0) errors.push(`${label}: drift-clear needs labels`);
@@ -173,7 +187,7 @@ export function checkRunSource(checkRun) {
  * verdict; the check run's own fields are never used for the decision.
  * @returns {{ bound: boolean, reason?: string, status?: string, conclusion?: string|null }}
  */
-export function bindCheckRun({ checkRun, job, workflowRun, repo, sha, name }) {
+export function bindCheckRun({ checkRun, job, workflowRun, repo, sha, name, workflow }) {
   const source = checkRunSource(checkRun);
   if (!source) return { bound: false, reason: "check run names no workflow run (details_url); it was not produced by GitHub Actions" };
   if (!source.jobId) return { bound: false, reason: `check run was published via the API by run ${source.runId}, not as a workflow job; its verdict cannot be verified` };
@@ -188,7 +202,8 @@ export function bindCheckRun({ checkRun, job, workflowRun, repo, sha, name }) {
   if (headRepo !== repo.toLowerCase()) return { bound: false, reason: `run ${source.runId} ran code from ${workflowRun.head_repository?.full_name ?? "an unknown repository"} (fork), not ${repo}` };
   if (UNTRUSTED_OBSERVER_EVENTS.includes(workflowRun.event)) return { bound: false, reason: `run ${source.runId} was triggered by ${workflowRun.event}; pull request runs cannot observe a stage head` };
   if ((workflowRun.head_sha ?? "").toLowerCase() !== sha.toLowerCase()) return { bound: false, reason: `run ${source.runId} ran for ${(workflowRun.head_sha ?? "?").slice(0, 7)}, not this head` };
-  return { bound: true, status: job.status, conclusion: job.conclusion ?? null, runId: source.runId, jobId: source.jobId };
+  if (workflow && workflowRun.path !== workflow) return { bound: false, reason: `run ${source.runId} is ${workflowRun.path ?? "an unknown workflow"}, not ${workflow}; a job named "${name}" elsewhere is not this observer` };
+  return { bound: true, status: job.status, conclusion: job.conclusion ?? null, runId: source.runId, jobId: source.jobId, path: workflowRun.path };
 }
 
 export function classifyCheckRun(run) {
@@ -209,7 +224,7 @@ export function classifyCheckRun(run) {
  * with the newest one's reason, so a forged check run can neither pass nor
  * fail a stage.
  */
-async function checkRunOnSha(api, repo, sha, name) {
+async function checkRunOnSha(api, repo, sha, name, workflow) {
   const data = await api.getJson(repo, `/commits/${sha}/check-runs`, { check_name: name, per_page: 50 });
   const candidates = informativeCheckRuns(data?.check_runs);
   if (candidates.length === 0) return classifyCheckRun(null);
@@ -223,23 +238,26 @@ async function checkRunOnSha(api, repo, sha, name) {
       if (!runCache.has(source.runId)) runCache.set(source.runId, await api.getJson(repo, `/actions/runs/${source.runId}`));
       workflowRun = runCache.get(source.runId);
     }
-    const binding = bindCheckRun({ checkRun, job, workflowRun, repo, sha, name });
+    const binding = bindCheckRun({ checkRun, job, workflowRun, repo, sha, name, workflow });
     if (binding.bound) {
       const verdict = classifyCheckRun({ status: binding.status, conclusion: binding.conclusion, html_url: checkRun.html_url });
-      return { ...verdict, detail: `${verdict.detail} (job ${binding.jobId} of run ${binding.runId})`, bound: true };
+      return { ...verdict, detail: `${verdict.detail} (job ${binding.jobId} of ${binding.path} run ${binding.runId})`, bound: true };
     }
     firstReason ??= binding.reason;
   }
   return { state: "pending", detail: `${candidates.length} check run(s) named "${name}" on this commit, none verifiable: ${firstReason}`, url: candidates[0].html_url, bound: false };
 }
 
-export function classifyWorkflowRuns(runs, { now, maxAgeHours = 36, afterHead = false, headCommittedAt, absent = "pending", repo }) {
+export function classifyWorkflowRuns(runs, { now, maxAgeHours = 36, afterHead = false, headCommittedAt, absent = "pending", repo, path, branch }) {
   const cutoff = now - maxAgeHours * 3600_000;
   const considered = (runs ?? [])
     .filter((run) => run.status === "completed" && run.conclusion !== "cancelled" && run.conclusion !== "skipped")
-    // Only this repository's own code observing the stage: not a fork, not a pull request run.
+    // Only the observer itself, from the target repository's own code on the trusted branch:
+    // not a fork, not a pull request run, not a same-named file elsewhere, not a stub on a feature branch.
     .filter((run) => !UNTRUSTED_OBSERVER_EVENTS.includes(run.event))
     .filter((run) => !repo || !run.head_repository?.full_name || run.head_repository.full_name.toLowerCase() === repo.toLowerCase())
+    .filter((run) => !path || !run.path || run.path === path)
+    .filter((run) => !branch || !run.head_branch || run.head_branch === branch)
     .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
   const latest = considered[0];
   if (!latest || Date.parse(latest.created_at) < cutoff) {
@@ -316,21 +334,35 @@ async function driftClear(api, signal, { selfRepo, base, sha }) {
   };
 }
 
+/** The target repository's default branch, cached on the evaluation context. */
+async function defaultBranchOf(api, repo, context) {
+  context.defaultBranches ??= new Map();
+  if (!context.defaultBranches.has(repo)) {
+    const repository = await api.getJson(repo, "");
+    if (!repository?.default_branch) throw new Error(`${repo}: could not resolve the default branch`);
+    context.defaultBranches.set(repo, repository.default_branch);
+  }
+  return context.defaultBranches.get(repo);
+}
+
 export async function evaluateSignal(api, signal, context) {
   const repo = signal.repo ?? context.selfRepo;
   try {
     switch (signal.type) {
       case "check-run":
-        return await checkRunOnSha(api, repo, context.sha, signal.name);
+        return await checkRunOnSha(api, repo, context.sha, signal.name, signal.workflow);
       case "workflow-run": {
+        const branch = signal.branch ?? (await defaultBranchOf(api, repo, context));
         const data = await api.getJson(repo, `/actions/workflows/${encodeURIComponent(signal.workflow)}/runs`, {
           status: "completed",
           per_page: 30,
-          branch: signal.branch,
+          branch,
           event: signal.event,
         });
         return classifyWorkflowRuns(data?.workflow_runs, {
           repo,
+          path: workflowPath(signal.workflow),
+          branch,
           now: context.now,
           maxAgeHours: signal.maxAgeHours,
           afterHead: signal.afterHead ?? false,
@@ -341,7 +373,7 @@ export async function evaluateSignal(api, signal, context) {
       case "branch-head": {
         const branch = await api.getJson(repo, `/branches/${encodeURIComponent(signal.branch)}`);
         if (!branch?.commit?.sha) return { state: "fail", detail: `${repo}@${signal.branch} does not exist` };
-        const result = await checkRunOnSha(api, repo, branch.commit.sha, signal.check ?? "Required Checks Gate");
+        const result = await checkRunOnSha(api, repo, branch.commit.sha, signal.check ?? "Required Checks Gate", signal.workflow);
         return { ...result, detail: `${repo}@${signal.branch} (${branch.commit.sha.slice(0, 7)}): ${result.detail}` };
       }
       case "drift-clear":

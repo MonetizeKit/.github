@@ -54,10 +54,11 @@
             { "$ref": "#/$defs/signalBase" },
             {
               "type": "object",
-              "required": ["type", "name"],
+              "required": ["type", "name", "workflow"],
               "properties": {
                 "type": { "const": "check-run" },
-                "name": { "type": "string", "description": "Exact check run name expected on the stage SHA." }
+                "name": { "type": "string", "description": "Exact check run (job) name expected on the stage SHA." },
+                "workflow": { "type": "string", "pattern": "^\\.github/workflows/[^/]+\\.ya?ml$", "description": "Path of the workflow whose job produces this check run. The check run is honored only when it binds to a job of a run of exactly this workflow, from this repository's own code, for the stage SHA — a job of the same name in any other workflow does not count." }
               }
             }
           ]
@@ -70,8 +71,8 @@
               "required": ["type", "workflow"],
               "properties": {
                 "type": { "const": "workflow-run" },
-                "workflow": { "type": "string", "pattern": "\\.ya?ml$", "description": "Workflow file name in the target repository." },
-                "branch": { "type": "string" },
+                "workflow": { "type": "string", "pattern": "\\.ya?ml$", "description": "Workflow file name in the target repository. Only runs of exactly `.github/workflows/<workflow>` count." },
+                "branch": { "type": "string", "description": "Branch the observer's runs must come from; defaults to the target repository's default branch. A run of the same file from any other branch (a stub on a feature branch) does not count." },
                 "event": { "type": "string" },
                 "maxAgeHours": { "type": "number", "exclusiveMinimum": 0, "default": 36, "description": "A completed run older than this means the loop is not observing the stage." },
                 "afterHead": { "type": "boolean", "default": false, "description": "Require the run to have started after the stage head landed (one soak cycle)." },
@@ -85,11 +86,12 @@
             { "$ref": "#/$defs/signalBase" },
             {
               "type": "object",
-              "required": ["type", "repo", "branch"],
+              "required": ["type", "repo", "branch", "workflow"],
               "properties": {
                 "type": { "const": "branch-head" },
                 "branch": { "type": "string" },
-                "check": { "type": "string", "default": "Required Checks Gate" }
+                "check": { "type": "string", "default": "Required Checks Gate" },
+                "workflow": { "type": "string", "pattern": "^\\.github/workflows/[^/]+\\.ya?ml$", "description": "Path, in `repo`, of the workflow whose job produces `check`; bound exactly like a check-run signal." }
               }
             }
           ]
