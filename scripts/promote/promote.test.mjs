@@ -372,6 +372,19 @@ test("promote: green development gate opens the PR, labels it and enables auto-m
   assert.ok(!api.calls.some((call) => call.method === "POST" && call.route === "/labels" && call.body.name === "promotion"));
 });
 
+test("promote: a check-runs read the token may not perform (private repo, no checks:read) degrades the display, never the decision", async () => {
+  const routes = baseRoutes();
+  routes[`${REPO}/commits/${HEAD}/check-runs`] = () => { throw new Error("GitHub API 403 for GET .../check-runs: Resource not accessible by integration"); };
+  const api = fakeApi(routes);
+  const result = await promote({ api, repo: REPO, source: "development", target: "delivery", gateName: "Stage Gate / development", autoMerge: true, now: NOW });
+  assert.equal(result.status, "opened");
+  assert.match(result.displayWarning, /could not read the Stage Gate \/ development check run/);
+  assert.equal(result.gate.url, trustedVerdict.runUrl, "falls back to the evaluation run link");
+  const open = api.calls.find((call) => call.method === "POST" && call.route === "/pulls");
+  assert.doesNotMatch(open.body.body, /Loop-by-loop verdict quoted/);
+  assert.match(open.body.body, /Provenance: the verdict is read from the Stage Gate workflow's own evaluation run/);
+});
+
 test("promote: an existing open promotion PR is updated in place, not duplicated", async () => {
   const routes = baseRoutes();
   routes[`${REPO}/pulls`] = [{ number: 70, node_id: "PR_70", html_url: "https://github.com/x/pull/70", head: { ref: "development" }, base: { ref: "delivery" } }];
