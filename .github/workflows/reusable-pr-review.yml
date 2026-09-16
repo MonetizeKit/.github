@@ -4,7 +4,9 @@
 # finding shape (schemas/review-findings.schema.json) as ONE PR comment.
 # Shadow mode: this workflow NEVER blocks — continue-on-error at the caller, no
 # required-check participation, and it self-skips green when no credential is
-# present (sync ANTHROPIC_API_KEY or AI_GATEWAY_API_KEY from Phase.dev).
+# present. Credentials are fetched at run time from Phase.dev (`PHASE_SDLC_TOKEN`
+# -> environment `sdlc`); ANTHROPIC_API_KEY / AI_GATEWAY_API_KEY passed as
+# secrets remain a fallback.
 #
 # Determinism contract: the model emits schema-constrained JSON; plain code
 # validates it and posts the comment. Prompt lives in this file — versioned,
@@ -26,6 +28,14 @@ on:
         description: Ref of MonetizeKit/.github to read agent-policy.json and schemas from
         type: string
         default: "v1"
+      phase_env:
+        description: Phase.dev environment holding the automation credentials
+        type: string
+        default: "sdlc"
+      phase_app_id:
+        description: Phase.dev application id
+        type: string
+        default: "026988b7-1ffa-499c-913b-3d0f031c4e58"
       review_md:
         description: Path (in the caller repo) of the review guide the reviewer must follow when present
         type: string
@@ -34,6 +44,9 @@ on:
       ANTHROPIC_API_KEY:
         required: false
       AI_GATEWAY_API_KEY:
+        required: false
+      PHASE_SDLC_TOKEN:
+        description: Phase.dev service token scoped to the `sdlc` environment; the automation credentials are fetched from it at run time
         required: false
 
 env:
@@ -72,12 +85,28 @@ jobs:
             echo "model=${MODEL_OVERRIDE}" >> "$GITHUB_OUTPUT"
           fi
 
+      # Automation credentials are fetched from Phase.dev at run time (org secret
+      # PHASE_SDLC_TOKEN, environment `sdlc`) rather than synced into every
+      # repository's Actions secrets; the values are masked and land in
+      # GITHUB_ENV. Secrets passed by the caller remain a fallback.
+      - name: Fetch automation secrets from Phase
+        id: phase
+        env:
+          POLICY_REF: ${{ inputs.policy_ref }}
+          PHASE_TOKEN: ${{ secrets.PHASE_SDLC_TOKEN }}
+          PHASE_ENV: ${{ inputs.phase_env }}
+          PHASE_APP_ID: ${{ inputs.phase_app_id }}
+        run: |
+          mkdir -p /tmp/phase-export
+          curl -fsSL "https://raw.githubusercontent.com/MonetizeKit/.github/${POLICY_REF}/scripts/phase/export-secrets.mjs" -o /tmp/phase-export/export-secrets.mjs
+          node /tmp/phase-export/export-secrets.mjs ANTHROPIC_API_KEY AI_GATEWAY_API_KEY
+
       - name: Check credential for the resolved route
         id: key
         env:
           ROUTE: ${{ steps.role.outputs.route }}
-          HAS_ANTHROPIC: ${{ secrets.ANTHROPIC_API_KEY != '' }}
-          HAS_GATEWAY: ${{ secrets.AI_GATEWAY_API_KEY != '' }}
+          HAS_ANTHROPIC: ${{ (env.ANTHROPIC_API_KEY || secrets.ANTHROPIC_API_KEY) != '' }}
+          HAS_GATEWAY: ${{ (env.AI_GATEWAY_API_KEY || secrets.AI_GATEWAY_API_KEY) != '' }}
         run: |
           if [ "${ROUTE}" = "gateway" ] && [ "${HAS_GATEWAY}" = "true" ]; then
             echo "present=true" >> "$GITHUB_OUTPUT"; echo "use=gateway" >> "$GITHUB_OUTPUT"
@@ -119,7 +148,7 @@ jobs:
         env:
           ANTHROPIC_BASE_URL: ${{ steps.key.outputs.use == 'gateway' && steps.role.outputs.anthropic_base_url || '' }}
         with:
-          anthropic_api_key: ${{ steps.key.outputs.use == 'gateway' && secrets.AI_GATEWAY_API_KEY || secrets.ANTHROPIC_API_KEY }}
+          anthropic_api_key: ${{ steps.key.outputs.use == 'gateway' && (env.AI_GATEWAY_API_KEY || secrets.AI_GATEWAY_API_KEY) || (env.ANTHROPIC_API_KEY || secrets.ANTHROPIC_API_KEY) }}
           claude_args: "--model ${{ steps.role.outputs.bare }} --allowedTools ${{ steps.role.outputs.tools }}"
           prompt: |
             You are the MonetizeKit shadow-mode PR reviewer running batched lenses in one pass.
