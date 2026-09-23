@@ -257,6 +257,44 @@ test("observerVerdict: the newest trusted run's job is the verdict; skipped jobs
   assert.equal((await observerVerdict([], ctx, jobsOf)).state, "pending");
 });
 
+test("observerVerdict: a flood of skipped deployment_status runs never hides the push run that observed the commit", async () => {
+  const mono = "MonetizeKit/mono";
+  const ctx = { repo: mono, workflow: ".github/workflows/ci.yml", sha: HEAD, name: "Required Checks Gate" };
+  const push = observerRun({ repo: mono, sha: HEAD, runId: 100, jobs: [{ name: "Required Checks Gate", conclusion: "success" }] });
+  // Eighteen newer runs, one per Vercel deployment event, each concluding skipped at the run level
+  // (as observed on a monorepo development head). None of them observed the commit.
+  const floods = Array.from({ length: 18 }, (_, index) =>
+    observerRun({
+      repo: mono,
+      sha: HEAD,
+      runId: 200 + index,
+      event: "deployment_status",
+      jobs: [{ name: "Required Checks Gate", conclusion: "skipped" }],
+      runOverrides: { status: "completed", conclusion: "skipped" },
+    }));
+  const jobsByRun = Object.fromEntries([push, ...floods].map((item) => [item.run.id, item.jobs]));
+  const lookups = [];
+  const jobsOf = async (runId) => { lookups.push(runId); return jobsByRun[runId]; };
+
+  const verdict = await observerVerdict([push.run, ...floods.map((item) => item.run)], ctx, jobsOf);
+  assert.equal(verdict.state, "pass", "the push run is still reached behind the skipped flood");
+  assert.equal(verdict.runId, 100);
+  assert.deepEqual(lookups, [100], "run-level skipped runs are classified without fetching their jobs");
+
+  // Job-level skips (run conclusion not skipped) are not counted against the window either.
+  const jobSkips = Array.from({ length: 12 }, (_, index) =>
+    observerRun({ repo: mono, sha: HEAD, runId: 300 + index, event: "deployment_status", jobs: [{ name: "Required Checks Gate", conclusion: "skipped" }] }));
+  const jobsByRun2 = Object.fromEntries([push, ...jobSkips].map((item) => [item.run.id, item.jobs]));
+  const verdict2 = await observerVerdict([push.run, ...jobSkips.map((item) => item.run)], ctx, async (runId) => jobsByRun2[runId]);
+  assert.equal(verdict2.state, "pass");
+  assert.equal(verdict2.runId, 100);
+
+  // Nothing but skipped runs: still pending via the fallback, never pass.
+  const onlySkipped = await observerVerdict(floods.map((item) => item.run), ctx, jobsOf);
+  assert.equal(onlySkipped.state, "pending");
+  assert.match(onlySkipped.detail, /concluded skipped/);
+});
+
 test("evaluateStage: forged or replayed check runs cannot move a required signal — check runs are never read", async () => {
   const mono = "MonetizeKit/mono";
   // Replay: ci.yml ran twice for this SHA; the older run passed, the newest failed. An attacker mints a check run
