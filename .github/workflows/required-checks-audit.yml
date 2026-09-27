@@ -1,0 +1,62 @@
+# Fleet-wide required-checks audit (scripts/audit/required-checks.mjs): every
+# context a stage-branch ruleset requires must have exactly one emitter that
+# cannot conclude `skipped`, on a workflow that runs only on PR/push events.
+# Rules and workflows drift independently of any one PR, so this runs on a
+# schedule against live rulesets rather than only in CI.
+#
+# Reading private repositories' rules needs a token beyond this repository's
+# GITHUB_TOKEN: GH_PAT is fetched from Phase.dev (PHASE_SDLC_TOKEN, environment
+# `sdlc`) and never printed.
+name: Required Checks Audit
+
+on:
+  schedule:
+    - cron: "17 7 * * 1"
+  workflow_dispatch:
+    inputs:
+      repos:
+        description: Comma-separated repositories to audit (default every non-archived repository in the org)
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: required-checks-audit
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    name: Audit required checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install
+        run: npm ci
+      - name: Fetch GH_PAT from Phase
+        env:
+          PHASE_TOKEN: ${{ secrets.PHASE_SDLC_TOKEN }}
+        run: node scripts/phase/export-secrets.mjs GH_PAT
+      - name: Audit
+        env:
+          REPOS: ${{ inputs.repos }}
+        run: |
+          if [ -z "${GH_PAT:-}" ]; then
+            echo "::error::GH_PAT is not available from Phase (environment sdlc); the audit cannot read private repositories' rules"
+            exit 1
+          fi
+          args=(--org MonetizeKit --out audit/required-checks.json)
+          [ -n "$REPOS" ] && args+=(--repos "$REPOS")
+          GH_TOKEN="$GH_PAT" node scripts/audit/required-checks.mjs "${args[@]}"
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: required-checks-audit
+          path: audit/required-checks.json
+          if-no-files-found: ignore

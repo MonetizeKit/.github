@@ -21,8 +21,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      - name: Install
+        run: npm ci
       - name: Unit tests (node:test)
-        run: node --test scripts/stage-gate/evaluate.test.mjs scripts/promote/promote.test.mjs scripts/phase/export-secrets.test.mjs
+        run: npm test
       - name: Policy and schema files parse
         run: |
           for file in agent-policy.json schemas/*.json ops/*.json; do
