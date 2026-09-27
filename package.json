@@ -1,0 +1,13 @@
+{
+  "name": "monetizekit-org-defaults",
+  "private": true,
+  "type": "module",
+  "description": "Scripts behind the org's reusable workflows. Only the required-checks audit has a dependency; the scripts consumers fetch from v1 stay dependency-free.",
+  "scripts": {
+    "test": "node --test scripts/stage-gate/evaluate.test.mjs scripts/promote/promote.test.mjs scripts/phase/export-secrets.test.mjs scripts/audit/required-checks.test.mjs",
+    "audit:required-checks": "node scripts/audit/required-checks.mjs"
+  },
+  "dependencies": {
+    "yaml": "2.9.1"
+  }
+}
