@@ -185,6 +185,12 @@ export function classifyCheckRun(run) {
  * triggered CI run skips "Required Checks Gate" after the push run's real one),
  * so the search continues to the next-newest run and falls back to the newest
  * such run only when nothing informative exists.
+ *
+ * Skipped runs do not count against `maxRuns`: a stage head that fans out to
+ * several deployments collects a `deployment_status` run per deployment event
+ * (eighteen were observed on one monorepo head), and the one push run that
+ * actually observed the commit must still be reachable behind them. A run whose
+ * own conclusion is `skipped` is classified without fetching its jobs.
  * @param {object[]} runs
  * @param {(runId: number|string) => Promise<object[]>} jobsOf
  */
@@ -200,15 +206,29 @@ export async function observerVerdict(runs, { repo, workflow, sha, name, maxRuns
       rejected.push(reason);
       continue;
     }
-    considered += 1;
+    if (run.status === "completed" && run.conclusion === "skipped") {
+      fallback ??= {
+        ...classifyCheckRun({ status: "completed", conclusion: "skipped", html_url: run.html_url }),
+        runId: run.id,
+        path: run.path,
+        bound: true,
+      };
+      fallback.detail = fallback.detail.includes(" (run ") ? fallback.detail : `${fallback.detail} (run ${run.id} of ${run.path} concluded skipped)`;
+      continue;
+    }
     const job = (await jobsOf(run.id)).find((candidate) => candidate.name === name);
-    if (!job) continue;
+    if (!job) {
+      considered += 1;
+      continue;
+    }
     const verdict = { ...classifyCheckRun({ status: job.status, conclusion: job.conclusion, html_url: job.html_url ?? run.html_url }), runId: run.id, jobId: job.id, path: run.path, bound: true };
     verdict.detail = `${verdict.detail} (job ${job.id} of ${run.path} run ${run.id})`;
     if (job.status === "completed" && ["skipped", "neutral"].includes(job.conclusion)) {
+      // Not informative and not counted: keep looking for the run that observed the commit.
       fallback ??= verdict;
       continue;
     }
+    considered += 1;
     return { ...verdict, considered, rejected };
   }
   if (fallback) return { ...fallback, considered, rejected };
