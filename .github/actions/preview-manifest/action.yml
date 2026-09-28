@@ -1,0 +1,85 @@
+name: Preview manifest
+description: >-
+  Register, unregister or sweep fleet PR preview surfaces in the preview
+  manifest (Vercel Edge Config), or compute a branch's preview label. Only
+  deployments of the surface's own Vercel project, repository and branch head
+  are registered. Runbook: docs/engineering/preview-surface-resolution.md in
+  the monorepo.
+
+inputs:
+  mode:
+    description: label | register | unregister | sweep | check
+    required: true
+  repository:
+    description: owner/name of the calling repository
+    required: false
+    default: ${{ github.repository }}
+  sha:
+    description: Commit the deployments must be built from (register); commit whose open PR names the branch (label)
+    required: false
+    default: ""
+  branch:
+    description: Branch name (label, unregister). For label, overrides the PR lookup
+    required: false
+    default: ""
+  deployments:
+    description: 'JSON object of surface -> Vercel deployment ID (register), e.g. {"web":"dpl_...","docs":"dpl_..."}'
+    required: false
+    default: ""
+  pull_request:
+    description: PR number recorded in the manifest entry (register)
+    required: false
+    default: ""
+  wait_seconds:
+    description: How long check waits for sibling previews to register before failing
+    required: false
+    default: "0"
+  vercel_token:
+    description: Vercel token with alias and Edge Config access on the team (register, unregister, sweep, check)
+    required: false
+    default: ""
+  github_token:
+    description: Token that can read the repository's branches and pull requests
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  label:
+    description: Preview label, empty when the branch never forms a preview set
+    value: ${{ steps.run.outputs.label }}
+  branch:
+    description: Branch the label was derived from
+    value: ${{ steps.run.outputs.branch }}
+  pull_request:
+    description: Open PR number found for the commit (label)
+    value: ${{ steps.run.outputs.pull_request }}
+  status:
+    description: registered | stale | excluded | unregistered | swept | complete
+    value: ${{ steps.run.outputs.status }}
+  origins:
+    description: JSON object of surface -> preview origin that were registered
+    value: ${{ steps.run.outputs.origins }}
+  removed:
+    description: JSON array of manifest keys removed
+    value: ${{ steps.run.outputs.removed }}
+  missing:
+    description: JSON array of open sibling PRs whose head is not registered (check)
+    value: ${{ steps.run.outputs.missing }}
+
+runs:
+  using: composite
+  steps:
+    - name: Preview manifest ${{ inputs.mode }}
+      id: run
+      shell: bash
+      env:
+        MANIFEST_MODE: ${{ inputs.mode }}
+        MANIFEST_REPOSITORY: ${{ inputs.repository }}
+        MANIFEST_SHA: ${{ inputs.sha }}
+        MANIFEST_BRANCH: ${{ inputs.branch }}
+        MANIFEST_DEPLOYMENTS: ${{ inputs.deployments }}
+        MANIFEST_PULL_REQUEST: ${{ inputs.pull_request }}
+        MANIFEST_WAIT_SECONDS: ${{ inputs.wait_seconds }}
+        VERCEL_TOKEN: ${{ inputs.vercel_token }}
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+      run: node "${{ github.action_path }}/../../../scripts/preview-manifest/manifest.mjs"
