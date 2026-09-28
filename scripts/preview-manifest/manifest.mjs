@@ -4,6 +4,7 @@
 //   register    verified Vercel deployments -> <label>.<base domain> alias + manifest entry
 //   unregister  remove a branch's entries and aliases for this repository's surfaces
 //   sweep       remove entries past expiresAt (daily, from this repository)
+//   check       wait until every open fleet PR on the branch registered its head
 // Runbook: docs/engineering/preview-surface-resolution.md in the monorepo.
 import { appendFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
@@ -11,6 +12,7 @@ import { pathToFileURL } from "node:url";
 import {
   PREVIEW_MANIFEST,
   SURFACES,
+  isLiveManifestEntry,
   manifestKey,
   previewOrigin,
 } from "../../packages/surface-origins/index.mjs";
@@ -77,17 +79,23 @@ export function createClients({ vercelToken, githubToken, fetch: fetchImpl = glo
       (await vercel(`/v2/deployments/${encodeURIComponent(id)}/aliases`)).aliases ?? [],
     assignDeploymentAlias: (id, alias) =>
       vercel(`/v2/deployments/${encodeURIComponent(id)}/aliases`, { method: "POST", body: { alias } }),
-    removeAlias: (alias) =>
-      vercel(`/v2/aliases/${encodeURIComponent(alias)}`, { method: "DELETE", allow404: true }),
+    // DELETE takes the alias ID only; a hostname there is always a 404.
+    removeAlias: async (alias) => {
+      const found = await vercel(`/v4/aliases/${encodeURIComponent(alias)}`, { allow404: true });
+      if (!found?.uid) return null;
+      return vercel(`/v2/aliases/${encodeURIComponent(found.uid)}`, { method: "DELETE", allow404: true });
+    },
     listItems: async () => {
       const items = await requestJson(fetchImpl, `${store}/items?${team}`, { token: vercelToken });
       return Array.isArray(items) ? items : [];
     },
-    getItem: (key) =>
-      requestJson(fetchImpl, `${store}/item/${encodeURIComponent(key)}?${team}`, {
+    getItem: async (key) => {
+      const item = await requestJson(fetchImpl, `${store}/item/${encodeURIComponent(key)}?${team}`, {
         token: vercelToken,
         allow404: true,
-      }),
+      });
+      return item?.value ?? null;
+    },
     patchItems: (items) =>
       requestJson(fetchImpl, `${store}/items?${team}`, { method: "PATCH", token: vercelToken, body: { items } }),
     branchHeadSha: async (repository, branch) => {
@@ -96,6 +104,11 @@ export function createClients({ vercelToken, githubToken, fetch: fetchImpl = glo
     },
     pullRequestsForCommit: async (repository, sha) =>
       (await github(`/repos/${repository}/commits/${sha}/pulls?per_page=100`)) ?? [],
+    openPullRequestsForBranch: async (repository, branch) => {
+      const owner = repository.split("/")[0];
+      const head = encodeURIComponent(`${owner}:${branch}`);
+      return (await github(`/repos/${repository}/pulls?state=open&head=${head}&per_page=100`)) ?? [];
+    },
   };
 }
 
@@ -215,6 +228,32 @@ export async function unregister(clients, { repository, branch, surfaces = SURFA
   return { status: "unregistered", branch, label, removed: entries.map(({ key }) => key) };
 }
 
+// Every open same-repository PR in the fleet on this branch must have a live
+// entry for its current head, so a gate cannot pass against development-stage
+// siblings while the real sibling change is still building.
+export async function checkSiblings(clients, { branch, now = Date.now(), surfaces = SURFACES }) {
+  const label = previewLabel(branch);
+  if (!label) return { status: "excluded", branch, label: null, missing: [] };
+  const repositories = [...new Set(Object.values(surfaces).map((definition) => definition.repository))];
+  const missing = [];
+  for (const repository of repositories) {
+    const pulls = await clients.openPullRequestsForBranch(repository, branch);
+    for (const pull of pulls.filter((candidate) => sameRepository(candidate.head?.repo?.full_name, repository))) {
+      const registered = [];
+      for (const surface of surfacesOf(repository, surfaces)) {
+        const value = await clients.getItem(manifestKey(label, surface));
+        if (isLiveManifestEntry(value, { label, surface, now, surfaces }) && sameRepository(value.repository, repository)) {
+          registered.push(value);
+        }
+      }
+      if (!registered.some((entry) => entry.sha === pull.head.sha)) {
+        missing.push({ repository, pullRequest: pull.number, sha: pull.head.sha });
+      }
+    }
+  }
+  return { status: missing.length === 0 ? "complete" : "incomplete", branch, label, missing };
+}
+
 export async function sweep(clients, { now = Date.now() } = {}) {
   const expired = (await clients.listItems()).filter(({ key, value }) => {
     if (typeof key !== "string" || !key.startsWith(KEY_PREFIX)) return false;
@@ -275,8 +314,26 @@ export async function main(env = process.env) {
       writeOutputs({ status: result.status, removed: result.removed });
       return result;
     }
+    case "check": {
+      required(env, "VERCEL_TOKEN");
+      const { branch } = await resolveLabel(clients, { repository, sha: env.MANIFEST_SHA?.trim(), branch: env.MANIFEST_BRANCH });
+      if (!branch) throw new Error("check needs MANIFEST_BRANCH or a MANIFEST_SHA with an open pull request");
+      const deadline = Date.now() + Number(env.MANIFEST_WAIT_SECONDS || 0) * 1000;
+      const pollMs = Number(env.MANIFEST_POLL_SECONDS || 30) * 1000;
+      let result = await checkSiblings(clients, { branch });
+      while (result.status === "incomplete" && Date.now() + pollMs <= deadline) {
+        console.log(`Waiting for sibling previews: ${JSON.stringify(result.missing)}`);
+        await new Promise((resolve) => setTimeout(resolve, pollMs));
+        result = await checkSiblings(clients, { branch });
+      }
+      writeOutputs({ status: result.status, label: result.label ?? "", branch, missing: result.missing });
+      if (result.status === "incomplete") {
+        throw new Error(`Sibling previews not registered for their head commit: ${JSON.stringify(result.missing)}`);
+      }
+      return result;
+    }
     default:
-      throw new Error(`MANIFEST_MODE must be label, register, unregister or sweep; received ${mode || "<empty>"}`);
+      throw new Error(`MANIFEST_MODE must be label, register, unregister, sweep or check; received ${mode || "<empty>"}`);
   }
 }
 

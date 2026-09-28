@@ -8,7 +8,7 @@ description: >-
 
 inputs:
   mode:
-    description: label | register | unregister | sweep
+    description: label | register | unregister | sweep | check
     required: true
   repository:
     description: owner/name of the calling repository
@@ -30,8 +30,12 @@ inputs:
     description: PR number recorded in the manifest entry (register)
     required: false
     default: ""
+  wait_seconds:
+    description: How long check waits for sibling previews to register before failing
+    required: false
+    default: "0"
   vercel_token:
-    description: Vercel token with alias and Edge Config write access on the team (register, unregister, sweep)
+    description: Vercel token with alias and Edge Config access on the team (register, unregister, sweep, check)
     required: false
     default: ""
   github_token:
@@ -50,7 +54,7 @@ outputs:
     description: Open PR number found for the commit (label)
     value: ${{ steps.run.outputs.pull_request }}
   status:
-    description: registered | stale | excluded | unregistered | swept
+    description: registered | stale | excluded | unregistered | swept | complete
     value: ${{ steps.run.outputs.status }}
   origins:
     description: JSON object of surface -> preview origin that were registered
@@ -58,6 +62,9 @@ outputs:
   removed:
     description: JSON array of manifest keys removed
     value: ${{ steps.run.outputs.removed }}
+  missing:
+    description: JSON array of open sibling PRs whose head is not registered (check)
+    value: ${{ steps.run.outputs.missing }}
 
 runs:
   using: composite
@@ -72,6 +79,7 @@ runs:
         MANIFEST_BRANCH: ${{ inputs.branch }}
         MANIFEST_DEPLOYMENTS: ${{ inputs.deployments }}
         MANIFEST_PULL_REQUEST: ${{ inputs.pull_request }}
+        MANIFEST_WAIT_SECONDS: ${{ inputs.wait_seconds }}
         VERCEL_TOKEN: ${{ inputs.vercel_token }}
         GITHUB_TOKEN: ${{ inputs.github_token }}
       run: node "${{ github.action_path }}/../../../scripts/preview-manifest/manifest.mjs"

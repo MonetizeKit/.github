@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { register, resolveLabel, sweep, unregister } from "./manifest.mjs";
+import { checkSiblings, createClients, register, resolveLabel, sweep, unregister } from "./manifest.mjs";
 import { manifestKey } from "../../packages/surface-origins/index.mjs";
 
 const REPO = "MonetizeKit/app-monetizekit-monorepo";
@@ -21,7 +21,7 @@ function deployment(surface, overrides = {}) {
   };
 }
 
-function fakeClients({ deployments = {}, aliases = {}, head = SHA, items = [], pulls = [] } = {}) {
+function fakeClients({ deployments = {}, aliases = {}, head = SHA, items = [], pulls = [], branchPulls = {} } = {}) {
   const calls = { assigned: [], patched: [], removedAliases: [] };
   const store = new Map(items.map(({ key, value }) => [key, value]));
   return {
@@ -46,6 +46,7 @@ function fakeClients({ deployments = {}, aliases = {}, head = SHA, items = [], p
     },
     branchHeadSha: async () => head,
     pullRequestsForCommit: async () => pulls,
+    openPullRequestsForBranch: async (repository) => branchPulls[repository] ?? [],
   };
 }
 
@@ -160,4 +161,87 @@ test("resolveLabel uses an explicit branch, else the commit's open same-reposito
     label: null,
     pullRequest: null,
   });
+});
+
+function liveEntry(surface, overrides = {}) {
+  const base = surface === "web" ? "app.monetizekit.dev" : "learning.monetizekit.dev";
+  return {
+    key: manifestKey(LABEL, surface),
+    value: {
+      repository: REPO,
+      surface,
+      origin: `https://${LABEL}.${base}`,
+      sha: SHA,
+      expiresAt: "2026-10-28T00:00:00.000Z",
+      ...overrides,
+    },
+  };
+}
+
+function openPull(sha, repository = REPO) {
+  return { number: 508, head: { sha, repo: { full_name: repository } } };
+}
+
+test("checkSiblings is complete only when every open fleet PR on the branch registered its head", async () => {
+  const complete = await checkSiblings(
+    fakeClients({ items: [liveEntry("web"), liveEntry("docs")], branchPulls: { [REPO]: [openPull(SHA)] } }),
+    { branch: BRANCH, now: NOW },
+  );
+  assert.equal(complete.status, "complete");
+
+  const newerHead = "b".repeat(40);
+  const stale = await checkSiblings(
+    fakeClients({ items: [liveEntry("web"), liveEntry("docs")], branchPulls: { [REPO]: [openPull(newerHead)] } }),
+    { branch: BRANCH, now: NOW },
+  );
+  assert.equal(stale.status, "incomplete");
+  assert.deepEqual(stale.missing, [{ repository: REPO, pullRequest: 508, sha: newerHead }]);
+});
+
+test("checkSiblings ignores expired or forged entries and fork PRs", async () => {
+  for (const entry of [
+    liveEntry("web", { expiresAt: "2026-09-27T00:00:00.000Z" }),
+    liveEntry("web", { origin: "https://attacker.example" }),
+    liveEntry("web", { repository: "MonetizeKit/other" }),
+  ]) {
+    const result = await checkSiblings(fakeClients({ items: [entry], branchPulls: { [REPO]: [openPull(SHA)] } }), {
+      branch: BRANCH,
+      now: NOW,
+    });
+    assert.equal(result.status, "incomplete");
+  }
+  const fork = await checkSiblings(fakeClients({ branchPulls: { [REPO]: [openPull(SHA, "someone/fork")] } }), {
+    branch: BRANCH,
+    now: NOW,
+  });
+  assert.equal(fork.status, "complete");
+  assert.equal((await checkSiblings(fakeClients(), { branch: "dependabot/npm/x", now: NOW })).status, "excluded");
+});
+
+test("the Edge Config client unwraps single-item responses to the stored value", async () => {
+  const value = { surface: "web", origin: `https://${LABEL}.app.monetizekit.dev` };
+  const clients = createClients({
+    vercelToken: "t",
+    githubToken: "g",
+    fetch: async (url) =>
+      String(url).includes("missing")
+        ? new Response("{}", { status: 404 })
+        : Response.json({ key: "k", value, createdAt: 1, updatedAt: 1, edgeConfigId: "ecfg" }),
+  });
+  assert.deepEqual(await clients.getItem("present"), value);
+  assert.equal(await clients.getItem("missing"), null);
+});
+
+test("the Vercel client removes an alias by looking up its ID", async () => {
+  const requests = [];
+  const clients = createClients({
+    vercelToken: "t",
+    githubToken: "g",
+    fetch: async (url, init) => {
+      requests.push(`${init.method} ${new URL(url).pathname}`);
+      return String(url).includes("/v4/aliases/") ? Response.json({ uid: "als_123" }) : Response.json({ status: "SUCCESS" });
+    },
+  });
+  await clients.removeAlias(`${LABEL}.app.monetizekit.dev`);
+  assert.deepEqual(requests, [`GET /v4/aliases/${LABEL}.app.monetizekit.dev`, "DELETE /v2/aliases/als_123"]);
 });
