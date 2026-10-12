@@ -8,12 +8,14 @@
 //   model           gateway-style id, e.g. anthropic/claude-sonnet-5
 //   bare            provider prefix stripped, e.g. claude-sonnet-5 (for Anthropic-API runtimes)
 //   fallback        gateway-style fallback id
-//   route           gateway | direct-anthropic | cursor-cloud-agent | none
+//   route           gateway | direct-anthropic | direct-typesafe | cursor-cloud-agent | none
 //   tools           comma-joined allowlist in claude-code-action syntax
 //   max_output_tokens, max_usd_per_run   budget fields when declared
 //   quorum_models   comma-joined quorum list when declared
 //   policy_version  the policy version, for provenance footers
 //   anthropic_base_url   set only when route == gateway (Anthropic-compatible gateway URL)
+//   base_url, credential_env, api   set only when route == direct-<provider>, from
+//                   direct_providers.<provider> (e.g. the TypeSafe System One API)
 //
 // Exit codes: 0 resolved; 2 role missing or not a policy-selected model role
 // (operator/none roles are still printed, with model empty, so a caller can
@@ -57,6 +59,7 @@ if (!entry) {
 }
 
 const model = entry.model_selection === "policy" ? entry.model : "";
+const direct = entry.route?.startsWith("direct-") ? policy.direct_providers?.[entry.route.slice("direct-".length)] : undefined;
 const out = {
   role,
   model_selection: entry.model_selection,
@@ -73,6 +76,9 @@ const out = {
   policy_version: policy.policy_version,
   anthropic_base_url:
     entry.route === "gateway" ? policy.gateway?.anthropic_compatible_base_url ?? "" : "",
+  base_url: direct?.base_url ?? "",
+  credential_env: direct?.credential_env ?? "",
+  api: direct?.api ?? "",
 };
 
 if (asJson) {

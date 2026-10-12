@@ -36,6 +36,26 @@
         }
       }
     },
+    "direct_providers": {
+      "type": "object",
+      "description": "Providers called on their own API instead of through the gateway, keyed by the model-ID provider prefix. A role reaches one with route `direct-<provider>`; model-watch does not judge these models against the gateway model list.",
+      "propertyNames": { "enum": ["typesafe"] },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["base_url", "models_endpoint", "credential_env", "api"],
+        "properties": {
+          "base_url": { "type": "string", "format": "uri" },
+          "models_endpoint": { "type": "string", "format": "uri" },
+          "credential_env": { "type": "string" },
+          "api": {
+            "type": "string",
+            "enum": ["systemone"],
+            "description": "Wire protocol. systemone: POST {base_url}/systemone with state + typed questions, returning typed answers with probabilities (no text generation)."
+          }
+        }
+      }
+    },
     "tiers": {
       "type": "object",
       "description": "Named cost tiers. A role references a tier so the model-usage loop can tell 'we chose the cheap tier' from 'we forgot to upgrade'.",
@@ -60,8 +80,8 @@
   "$defs": {
     "modelId": {
       "type": "string",
-      "pattern": "^(anthropic|openai|google|xai|mistral)/[a-z0-9][a-z0-9.-]*$",
-      "description": "Gateway-style model ID (provider/model). Callers that speak a provider API directly strip the provider prefix with the resolver's `bare` output."
+      "pattern": "^(anthropic|openai|google|xai|mistral|typesafe)/[a-z0-9][a-z0-9.-]*$",
+      "description": "Gateway-style model ID (provider/model). Callers that speak a provider API directly strip the provider prefix with the resolver's `bare` output. `typesafe/` models are decision models on a direct provider and never route through the gateway."
     },
     "environment": { "type": "string", "enum": ["development", "delivery", "production"] },
     "autonomy": {
@@ -105,8 +125,8 @@
         },
         "route": {
           "type": "string",
-          "enum": ["gateway", "direct-anthropic", "cursor-cloud-agent", "none"],
-          "description": "gateway: AI_GATEWAY_API_KEY through the Vercel AI Gateway. direct-anthropic: ANTHROPIC_API_KEY. cursor-cloud-agent: launched as a Cursor Cloud Agent or Automation (credential and model managed there). none: deterministic."
+          "enum": ["gateway", "direct-anthropic", "direct-typesafe", "cursor-cloud-agent", "none"],
+          "description": "gateway: AI_GATEWAY_API_KEY through the Vercel AI Gateway. direct-anthropic: ANTHROPIC_API_KEY. direct-typesafe: the TypeSafe System One API declared under direct_providers.typesafe (typed decisions, no text). cursor-cloud-agent: launched as a Cursor Cloud Agent or Automation (credential and model managed there). none: deterministic."
         },
         "budget": {
           "type": "object",
@@ -168,6 +188,14 @@
         {
           "if": { "properties": { "model_selection": { "const": "none" } } },
           "then": { "properties": { "route": { "const": "none" } }, "not": { "required": ["model"] } }
+        },
+        {
+          "if": { "properties": { "route": { "const": "direct-typesafe" } }, "required": ["route"] },
+          "then": { "required": ["model"], "properties": { "model": { "pattern": "^typesafe/" } } }
+        },
+        {
+          "if": { "properties": { "model": { "pattern": "^typesafe/" } }, "required": ["model"] },
+          "then": { "properties": { "route": { "const": "direct-typesafe" } } }
         },
         {
           "if": { "properties": { "autonomy": { "type": "object", "properties": { "production": { "enum": ["act", "propose", "prepare-only"] } } } } },
