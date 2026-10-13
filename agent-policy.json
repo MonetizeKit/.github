@@ -1,8 +1,8 @@
 {
   "$schema": "https://raw.githubusercontent.com/MonetizeKit/.github/v1/schemas/agent-policy.schema.json",
   "schema_version": 1,
-  "policy_version": "1.3.0",
-  "reviewed_at": "2026-10-12",
+  "policy_version": "1.4.2",
+  "reviewed_at": "2026-10-13",
   "review_due": "2026-12-14",
   "gateway": {
     "provider": "vercel-ai-gateway",
@@ -197,6 +197,18 @@
       "human_gate": true,
       "owner": "@EtherealVisions",
       "surfaces": ["app-monetizekit-monorepo:scripts/docs/review-promotion-range-with-llm.mjs", "app-monetizekit-monorepo:.github/workflows/ci-docs-validation.yml"],
+      "status": "active"
+    },
+    "approval-robot": {
+      "description": "The GitHub machine user MonetizeKit-Robot, the org's only identity besides the owner. It submits the single approving review that branch rulesets require (required_approving_review_count 1), because GitHub never counts an author's own approval and every PR here is authored by @EtherealVisions. It approves only a PR whose required checks are green, only when the owner asks, and never authors commits, merges or bypasses a ruleset. Credential: GH_PAT in the Phase app Entitlements.C9D.Engineering (Development); a session without write access to GitHub cannot act as this role.",
+      "model_selection": "operator",
+      "route": "cursor-cloud-agent",
+      "tools": ["Bash(gh pr review*)"],
+      "data_classes": ["public", "internal"],
+      "autonomy": { "development": "act", "delivery": "act", "production": "act" },
+      "human_gate": true,
+      "owner": "@EtherealVisions",
+      "surfaces": ["app-monetizekit-monorepo:docs/engineering/promotion.md"],
       "status": "active"
     },
     "build-failure-triage": {

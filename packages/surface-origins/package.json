@@ -1,0 +1,25 @@
+{
+  "name": "@monetizekit/surface-origins",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Surface registry and per-request origin resolution for fleet PR previews. Dependency-free; installed by member repositories as a git dependency.",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.mjs"
+    },
+    "./label": {
+      "types": "./label.d.ts",
+      "default": "./label.mjs"
+    }
+  },
+  "files": [
+    "index.mjs",
+    "index.d.ts",
+    "label.mjs",
+    "label.d.ts",
+    "registry.mjs"
+  ]
+}
