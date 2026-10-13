@@ -1,0 +1,51 @@
+# Removes a closed PR's surfaces from the fleet preview manifest and deletes
+# their <label>.<base domain> aliases. Callers run it on
+# `pull_request: types: [closed]` and pass `secrets: inherit`. Fork PRs are
+# ignored: a fork branch sharing a name with a real branch must not remove it.
+name: Preview manifest cleanup
+
+on:
+  workflow_call:
+    inputs:
+      policy_ref:
+        description: Ref of MonetizeKit/.github the action and scripts are taken from
+        required: false
+        type: string
+        default: v1
+    secrets:
+      PHASE_SDLC_TOKEN:
+        required: false
+      VERCEL_API_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  unregister:
+    name: Unregister preview surfaces
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: MonetizeKit/.github
+          ref: ${{ inputs.policy_ref }}
+          path: .org-defaults
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Fetch automation secrets from Phase
+        env:
+          PHASE_TOKEN: ${{ secrets.PHASE_SDLC_TOKEN }}
+        run: node .org-defaults/scripts/phase/export-secrets.mjs VERCEL_API_TOKEN
+
+      - name: Unregister
+        uses: ./.org-defaults/.github/actions/preview-manifest
+        with:
+          mode: unregister
+          branch: ${{ github.event.pull_request.head.ref }}
+          vercel_token: ${{ env.VERCEL_API_TOKEN || secrets.VERCEL_API_TOKEN }}
