@@ -1,8 +1,8 @@
 {
   "$schema": "https://raw.githubusercontent.com/MonetizeKit/.github/v1/schemas/agent-policy.schema.json",
   "schema_version": 1,
-  "policy_version": "1.4.0",
-  "reviewed_at": "2026-09-14",
+  "policy_version": "1.5.0",
+  "reviewed_at": "2026-10-13",
   "review_due": "2026-12-14",
   "gateway": {
     "provider": "vercel-ai-gateway",
@@ -11,7 +11,20 @@
     "credential_env": "AI_GATEWAY_API_KEY",
     "anthropic_compatible_base_url": "https://ai-gateway.vercel.sh"
   },
+  "direct_providers": {
+    "typesafe": {
+      "base_url": "https://api.typesafe.ai/v1",
+      "models_endpoint": "https://api.typesafe.ai/v1/models",
+      "credential_env": "TYPESAFE_API_KEY",
+      "api": "systemone"
+    }
+  },
   "tiers": {
+    "decision": {
+      "purpose": "Typed decisions with calibrated probabilities (classify, route, score) in front of a text model; never writes prose. Pinned to a versioned ID because confidence thresholds are tuned per version.",
+      "model": "typesafe/jev-1.13.0",
+      "fallback": "anthropic/claude-haiku-4.5"
+    },
     "triage": {
       "purpose": "Short classification and summarisation over logs or diffs: build-failure triage, drift summaries, failure categorisation.",
       "model": "anthropic/claude-haiku-4.5",
@@ -227,6 +240,23 @@
       "surfaces": ["app-monetizekit-monorepo:.github/workflows/ci.yml#triage-failed-build"],
       "status": "active",
       "prompt_version_env": "TRIAGE_PROMPT_VERSION"
+    },
+    "build-failure-triage:decision": {
+      "description": "Shadow decision pass beside build-failure-triage: classifies the failing job, the verdict (real, flaky, infra, config) and a next step from a fixed list over the same redacted logs, and records agreement with the text triage in the job summary. Never comments, never gates; fails open.",
+      "model_selection": "policy",
+      "tier": "decision",
+      "model": "typesafe/jev-1.13.0",
+      "fallback": "anthropic/claude-haiku-4.5",
+      "route": "direct-typesafe",
+      "budget": { "max_usd_per_run": 0.01 },
+      "tools": [],
+      "data_classes": ["public", "internal", "secrets-redacted"],
+      "autonomy": { "development": "read-only", "delivery": "read-only", "production": "read-only" },
+      "human_gate": false,
+      "owner": "@EtherealVisions",
+      "surfaces": ["app-monetizekit-monorepo:.github/workflows/ci.yml#triage-failed-build", "app-monetizekit-monorepo:scripts/build-triage/decision-shadow.mjs"],
+      "status": "shadow",
+      "prompt_version_env": "TRIAGE_DECISION_PROMPT_VERSION"
     },
     "docs-maintenance-agent": {
       "description": "Launched from a docs-drift issue; refreshes documentation and registry stamps and opens a PR. Charter: docs/engineering/docs-maintenance/AGENT.md.",
