@@ -2,7 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { guardDecision, OVERRIDE_LABEL, UPSTREAM } from "./guard.mjs";
+import { gateEvidenceDecision, guardDecision, OVERRIDE_LABEL, UPSTREAM } from "./guard.mjs";
 import {
   DEFAULT_GATE_WORKFLOW,
   HOPS,
@@ -451,4 +451,96 @@ test("guardDecision: a fork branch named like the stage is not the stage branch"
   assert.equal(guardDecision({ baseRef: "delivery", headRef: "development", headRepo: REPO.toUpperCase(), baseRepo: REPO }).pass, true);
   // Feature PRs into development are not guarded, so the head repository does not matter there.
   assert.equal(guardDecision({ baseRef: "development", headRef: "feat/x", headRepo: "someone/fork", baseRepo: REPO }).pass, true);
+});
+
+// --------------------------------------------------------------------------
+// Gate evidence bound to the promotion PR's head
+// --------------------------------------------------------------------------
+
+const MOVED = "c".repeat(40);
+const TREE = "d".repeat(40);
+
+/** Stage Gate runs (newest first by id) plus per-run artifact names and commit trees. */
+function evidenceApi({ runs, artifacts, trees = {} }) {
+  const routes = {
+    [REPO]: { default_branch: "main" },
+    [`${REPO}/actions/workflows/stage-gate.yml/runs`]: { workflow_runs: runs },
+  };
+  for (const [runId, names] of Object.entries(artifacts)) {
+    routes[`${REPO}/actions/runs/${runId}/artifacts`] = { artifacts: names.map((name) => ({ name })) };
+  }
+  for (const [sha, tree] of Object.entries(trees)) routes[`${REPO}/git/commits/${sha}`] = { sha, tree: { sha: tree } };
+  return fakeApi(routes);
+}
+
+test("gateEvidenceDecision: a trusted success for the exact head passes", async () => {
+  const api = evidenceApi({ runs: [gateWorkflowRun({ id: 10 })], artifacts: { 10: [`stage-gate-development-${HEAD}-success`] } });
+  const decision = await gateEvidenceDecision(api, { repo: REPO, stage: "development", headSha: HEAD });
+  assert.equal(decision.pass, true);
+  assert.equal(decision.treeEqual, false);
+  assert.equal(decision.runId, 10);
+});
+
+test("gateEvidenceDecision: the newest trusted evaluation of the head decides; an older green cannot outvote a later red", async () => {
+  const api = evidenceApi({
+    runs: [gateWorkflowRun({ id: 11 }), gateWorkflowRun({ id: 10 })],
+    artifacts: { 11: [`stage-gate-development-${HEAD}-failure`], 10: [`stage-gate-development-${HEAD}-success`] },
+  });
+  const decision = await gateEvidenceDecision(api, { repo: REPO, stage: "development", headSha: HEAD });
+  assert.equal(decision.pass, false);
+  assert.match(decision.reason, /run 11\) is failure/);
+});
+
+test("gateEvidenceDecision: a head that moved after the gate fails until the gate passes on it", async () => {
+  const api = evidenceApi({
+    runs: [gateWorkflowRun({ id: 10 })],
+    artifacts: { 10: [`stage-gate-development-${HEAD}-success`] },
+    trees: { [MOVED]: "e".repeat(40), [HEAD]: TREE },
+  });
+  const decision = await gateEvidenceDecision(api, { repo: REPO, stage: "development", headSha: MOVED });
+  assert.equal(decision.pass, false);
+  assert.match(decision.reason, /no trusted Stage Gate \/ development evaluation of ccccccc/);
+  assert.match(decision.reason, /none of the 1 recently gated commit\(s\) has the same tree/);
+});
+
+test("gateEvidenceDecision: a head whose tree equals a gated commit passes (a merge that changes no file)", async () => {
+  const api = evidenceApi({
+    runs: [gateWorkflowRun({ id: 10 })],
+    artifacts: { 10: [`stage-gate-development-${HEAD}-success`] },
+    trees: { [MOVED]: TREE, [HEAD]: TREE },
+  });
+  const decision = await gateEvidenceDecision(api, { repo: REPO, stage: "development", headSha: MOVED });
+  assert.equal(decision.pass, true);
+  assert.equal(decision.treeEqual, true);
+  assert.equal(decision.gatedSha, HEAD);
+  assert.match(decision.reason, /whose tree is identical to ccccccc/);
+});
+
+test("gateEvidenceDecision: a tree-equal commit counts only when its newest trusted verdict is a success", async () => {
+  const api = evidenceApi({
+    runs: [gateWorkflowRun({ id: 11 }), gateWorkflowRun({ id: 10 })],
+    artifacts: { 11: [`stage-gate-development-${HEAD}-failure`], 10: [`stage-gate-development-${HEAD}-success`] },
+    trees: { [MOVED]: TREE, [HEAD]: TREE },
+  });
+  const decision = await gateEvidenceDecision(api, { repo: REPO, stage: "development", headSha: MOVED });
+  assert.equal(decision.pass, false);
+});
+
+test("gateEvidenceDecision: evidence from untrusted runs (pull request, feature branch, other stage) is ignored", async () => {
+  const api = evidenceApi({
+    runs: [
+      gateWorkflowRun({ id: 12, event: "pull_request" }),
+      gateWorkflowRun({ id: 11, head_branch: "feat/forge" }),
+      gateWorkflowRun({ id: 10 }),
+    ],
+    artifacts: {
+      12: [`stage-gate-development-${HEAD}-success`],
+      11: [`stage-gate-development-${HEAD}-success`],
+      10: [`stage-gate-delivery-${HEAD}-success`],
+    },
+    trees: { [HEAD]: TREE },
+  });
+  const decision = await gateEvidenceDecision(api, { repo: REPO, stage: "development", headSha: HEAD });
+  assert.equal(decision.pass, false);
+  assert.match(decision.reason, /no trusted Stage Gate \/ development evaluation of aaaaaaa/);
 });

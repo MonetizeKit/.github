@@ -11,6 +11,14 @@
 #
 # Call from a `pull_request` workflow with `branches: [delivery, main]` and add
 # `promotion-guard` to branch protection on both branches.
+#
+# `require_gate_evidence: true` also binds the chain hop to the Stage Gate: the
+# check fails unless a trusted `Stage Gate / <source>` success exists for the
+# PR's exact head SHA (or a commit with the identical tree), so a commit that
+# lands on the source branch after auto-merge was enabled cannot ride along
+# ungated. It reads the gate workflow's runs and artifacts, so the caller's
+# guard job must grant `actions: read`. The job declares no permissions of its
+# own and runs with exactly what the caller grants (at least `contents: read`).
 name: Reusable promotion-guard
 
 on:
@@ -20,6 +28,14 @@ on:
         description: Ref of MonetizeKit/.github to read the guard from
         type: string
         default: "v1"
+      require_gate_evidence:
+        description: Require a trusted Stage Gate success for the PR head (caller grants actions read)
+        type: boolean
+        default: false
+      gate_workflow:
+        description: Path (in the caller repo) of the Stage Gate workflow whose default-branch runs and artifacts are the evidence
+        type: string
+        default: ".github/workflows/stage-gate.yml"
     outputs:
       pass:
         description: "true when the PR is the expected hop or an audited override"
@@ -32,8 +48,6 @@ jobs:
   guard:
     name: promotion-guard
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     outputs:
       pass: ${{ steps.guard.outputs.pass }}
       override: ${{ steps.guard.outputs.override }}
@@ -47,7 +61,9 @@ jobs:
           POLICY_REF: ${{ inputs.policy_ref }}
         run: |
           mkdir -p /tmp/promote
-          curl -fsSL "https://raw.githubusercontent.com/MonetizeKit/.github/${POLICY_REF}/scripts/promote/guard.mjs" -o /tmp/promote/guard.mjs
+          for file in guard.mjs run.mjs; do
+            curl -fsSL "https://raw.githubusercontent.com/MonetizeKit/.github/${POLICY_REF}/scripts/promote/${file}" -o "/tmp/promote/${file}"
+          done
 
       - name: Check the hop
         id: guard
@@ -57,4 +73,8 @@ jobs:
           # Empty when the head repository was deleted; the guard fails closed.
           PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REQUIRE_GATE_EVIDENCE: ${{ inputs.require_gate_evidence }}
+          GATE_WORKFLOW: ${{ inputs.gate_workflow }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: node /tmp/promote/guard.mjs
