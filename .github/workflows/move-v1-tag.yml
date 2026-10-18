@@ -1,0 +1,43 @@
+# Moves the fleet-wide `v1` tag forward after CI is green on main, so merged
+# reusable-workflow and policy changes reach callers without a hand-run
+# force push. Forward-only; rollback remains a deliberate manual re-point.
+name: Move v1 tag
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Report the decision without moving the tag
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: move-v1-tag
+  cancel-in-progress: false
+
+jobs:
+  move:
+    name: Move v1 forward
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/release
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Move the tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+        run: node scripts/release/move-tag.mjs
