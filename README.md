@@ -27,7 +27,9 @@ Agent roles and delegation are explained in
 ## Versioning
 
 Consumers pin by tag: `MonetizeKit/.github/.github/workflows/reusable-sdk-ci.yml@v1`.
-Rollback across the fleet = re-point the `v1` tag; individual repos can pin a SHA.
+`.github/workflows/move-v1-tag.yml` moves `v1` forward to each commit on `main`
+whose CI run succeeded; it never moves the tag backwards or across a divergence.
+Rollback across the fleet = re-point the `v1` tag by hand; individual repos can pin a SHA.
 `agent-policy.json` is fetched by callers from the same `v1` tag, so a policy
 change becomes effective fleet-wide when `v1` moves.
 
