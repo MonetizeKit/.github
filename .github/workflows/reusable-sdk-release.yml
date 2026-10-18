@@ -1,6 +1,12 @@
 # Reusable Changesets release for MonetizeKit SDK packages.
 # Publishes to npm with provenance (requires caller permissions:
-# contents: write, pull-requests: write, id-token: write and secrets: inherit).
+# actions: write, contents: write, pull-requests: write, id-token: write and
+# secrets: inherit).
+#
+# A release PR opened with GITHUB_TOKEN does not trigger pull_request or push
+# workflows, so the required "Required Checks Gate" would never report on it.
+# workflow_dispatch is exempt from that rule: after the release PR branch is
+# updated, CI is dispatched on it and its check runs attach to the PR head.
 name: Reusable SDK Release
 
 on:
@@ -19,6 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: Production
     permissions:
+      actions: write
       contents: write
       pull-requests: write
       id-token: write
@@ -44,6 +51,7 @@ jobs:
             echo "present=true" >> "$GITHUB_OUTPUT"
           fi
       - name: Create release PR or publish
+        id: changesets
         if: steps.npm-token.outputs.present == 'true'
         uses: changesets/action@v1
         with:
@@ -54,3 +62,9 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           # npm provenance: links the published tarball to this workflow run (public repos)
           NPM_CONFIG_PROVENANCE: "true"
+      - name: Run CI on the release PR
+        if: steps.changesets.outputs.pullRequestNumber != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_BRANCH: changeset-release/${{ github.ref_name }}
+        run: gh workflow run ci.yml --ref "$RELEASE_BRANCH"
