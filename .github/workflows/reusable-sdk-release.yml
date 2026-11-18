@@ -1,6 +1,11 @@
 # Reusable Changesets release for MonetizeKit SDK packages.
-# Publishes to npm with provenance (requires caller permissions:
-# contents: write, pull-requests: write, id-token: write and secrets: inherit).
+# Publishes to npm with npm trusted publishing (OIDC) and provenance. Requires
+# caller permissions: contents: write, pull-requests: write, id-token: write
+# and secrets: inherit. There is no npm token: each package must have a
+# trusted publisher on npmjs.com naming the caller's repository, the workflow
+# file `release.yml` (the caller, not this reusable file) and the environment
+# `Production`, with direct `npm publish` allowed. A package without one
+# fails its publish with E404.
 #
 # The release PR is opened and updated with the automation account's token
 # (GH_PAT, fetched at run time from Phase.dev like the promotion bot does), not
@@ -31,8 +36,6 @@ on:
         type: string
         default: "026988b7-1ffa-499c-913b-3d0f031c4e58"
     secrets:
-      NPM_TOKEN:
-        required: false
       PHASE_SDLC_TOKEN:
         description: Phase.dev service token scoped to the `sdlc` environment; GH_PAT is fetched from it at run time
         required: false
@@ -47,10 +50,20 @@ jobs:
       pull-requests: write
       id-token: write
     steps:
+      # No registry-url: setup-node would write an .npmrc carrying a
+      # NODE_AUTH_TOKEN placeholder, and a token in the npm config competes
+      # with the OIDC exchange.
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ inputs.node-version }}
-          registry-url: https://registry.npmjs.org
+      # `pnpm publish` (what `changeset publish` runs under pnpm) hands the
+      # upload to the npm CLI, and npm only performs the OIDC exchange from
+      # 11.5.1. Node 22 bundles npm 10.
+      - name: Install npm with trusted publishing support
+        run: |
+          npm install -g npm@11
+          node -e 'const [a,b,c]=process.argv[1].split(".").map(Number); if (a*1e6+b*1e3+c < 11005001) { console.error("npm " + process.argv[1] + " is older than 11.5.1"); process.exit(1); }' "$(npm --version)"
+          echo "npm $(npm --version)"
       # GH_PAT is a long-lived org credential: it must not exist in the job
       # environment or in persisted git credentials while dependency install
       # scripts run. changesets/action writes its own ~/.netrc from the token
@@ -73,47 +86,12 @@ jobs:
           mkdir -p /tmp/phase-export
           curl -fsSL "https://raw.githubusercontent.com/MonetizeKit/.github/${POLICY_REF}/scripts/phase/export-secrets.mjs" -o /tmp/phase-export/export-secrets.mjs
           node /tmp/phase-export/export-secrets.mjs GH_PAT
-      - name: Check NPM_TOKEN
-        id: npm-token
-        run: |
-          if [ -z "${{ secrets.NPM_TOKEN }}" ]; then
-            echo "::warning::NPM_TOKEN is not set (sync from Phase.dev to the Production environment); skipping publish."
-            echo "present=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "present=true" >> "$GITHUB_OUTPUT"
-          fi
-      # npm answers a publish with an expired or revoked token with a bare
-      # E404 on PUT, which reads like a missing package. Check the token
-      # first; fail only when this run would publish (no pending changesets),
-      # so a release PR can still be opened while the token is being rotated.
-      - name: Verify NPM_TOKEN
-        if: steps.npm-token.outputs.present == 'true'
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          if user=$(npm whoami 2>/dev/null); then
-            echo "npm token authenticates as ${user}"
-            exit 0
-          fi
-          message="NPM_TOKEN is rejected by the npm registry (expired or revoked). Rotate it in Phase.dev (Production) and let the sync update the Production environment."
-          if find .changeset -maxdepth 1 -name '*.md' ! -name 'README.md' | grep -q .; then
-            echo "::warning::${message} Pending changesets: opening the release PR only."
-          else
-            echo "::error::${message}"
-            exit 1
-          fi
       - name: Create release PR or publish
-        if: steps.npm-token.outputs.present == 'true'
         uses: changesets/action@v1
         with:
           publish: pnpm exec changeset publish
           version: pnpm exec changeset version
         env:
           GITHUB_TOKEN: ${{ env.GH_PAT || secrets.GITHUB_TOKEN }}
-          # changesets/action only reads NPM_TOKEN; without it the action
-          # switches to npm trusted publishing, which these packages do not
-          # have configured, and the publish fails with E404.
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           # npm provenance: links the published tarball to this workflow run (public repos)
           NPM_CONFIG_PROVENANCE: "true"
