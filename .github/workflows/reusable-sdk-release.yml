@@ -86,6 +86,16 @@ jobs:
           mkdir -p /tmp/phase-export
           curl -fsSL "https://raw.githubusercontent.com/MonetizeKit/.github/${POLICY_REF}/scripts/phase/export-secrets.mjs" -o /tmp/phase-export/export-secrets.mjs
           node /tmp/phase-export/export-secrets.mjs GH_PAT
+      # npm logs a rejected OIDC exchange only at verbose level and then fails
+      # the publish with a bare ENEEDAUTH; this surfaces the registry's reason
+      # and the claims it compared. No-op when this run would not publish.
+      - name: Verify npm trusted publishing
+        env:
+          POLICY_REF: ${{ inputs.policy_ref }}
+        run: |
+          mkdir -p /tmp/release
+          curl -fsSL "https://raw.githubusercontent.com/MonetizeKit/.github/${POLICY_REF}/scripts/release/verify-trusted-publishing.mjs" -o /tmp/release/verify-trusted-publishing.mjs
+          node /tmp/release/verify-trusted-publishing.mjs
       - name: Create release PR or publish
         uses: changesets/action@v1
         with:
